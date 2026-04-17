@@ -9,7 +9,10 @@
 #include <vector>
 
 #include "svg_entry.h"
+#include "svg_geometry.h"
 #include "svg_paint.h"
+#include "svg_path.h"
+#include "svg_transform.h"
 #include "svg_util.h"
 
 namespace fs = std::filesystem;
@@ -119,17 +122,62 @@ std::string render_path_entry(const PathEntry& entry, const std::optional<std::s
 std::string render_svg_document(const pugi::xml_node& svg_root,
                                 const std::vector<PathEntry>& paths,
                                 const std::optional<std::string>& fill_override) {
+  // Parse viewBox to detect non-zero origin that needs normalization.
+  double vb_min_x = 0.0, vb_min_y = 0.0, vb_w = 0.0, vb_h = 0.0;
+  bool has_viewbox = false;
+  bool needs_viewbox_normalize = false;
+  if (svg_root.attribute("viewBox")) {
+    const std::vector<double> vb = parse_number_list(svg_root.attribute("viewBox").as_string());
+    if (vb.size() >= 4) {
+      vb_min_x = vb[0];
+      vb_min_y = vb[1];
+      vb_w = vb[2];
+      vb_h = vb[3];
+      has_viewbox = true;
+      needs_viewbox_normalize = (std::abs(vb_min_x) > 1e-6 || std::abs(vb_min_y) > 1e-6);
+    }
+  }
+
+  // If viewBox has non-zero origin, translate all paths so the viewBox can start at 0,0.
+  std::vector<PathEntry> normalized_paths;
+  const std::vector<PathEntry>& output_paths = needs_viewbox_normalize ? normalized_paths : paths;
+  if (needs_viewbox_normalize) {
+    const std::string translate_str = "translate(" + fmt(-vb_min_x) + " " + fmt(-vb_min_y) + ")";
+    const Matrix translate_matrix = parse_transform(translate_str);
+    normalized_paths.reserve(paths.size());
+    for (const PathEntry& entry : paths) {
+      PathEntry shifted = entry;
+      if (shifted.transform.empty()) {
+        const auto baked = bake_path_transform(shifted.d, translate_matrix);
+        if (baked) {
+          shifted.d = *baked;
+        } else {
+          shifted.transform = translate_str;
+        }
+      } else {
+        shifted.transform = translate_str + " " + shifted.transform;
+      }
+      normalized_paths.push_back(std::move(shifted));
+    }
+  }
+
   std::ostringstream out;
   out << "<svg xmlns=\"http://www.w3.org/2000/svg\"";
   const std::vector<std::string> serialized_defs = fill_override.has_value()
     ? std::vector<std::string>{}
-    : collect_serialized_defs(svg_root, paths);
+    : collect_serialized_defs(svg_root, output_paths);
   if (!serialized_defs.empty()) {
     out << " xmlns:xlink=\"http://www.w3.org/1999/xlink\"";
   }
   if (svg_root.attribute("width")) out << " width=\"" << xml_escape(svg_root.attribute("width").as_string()) << "\"";
   if (svg_root.attribute("height")) out << " height=\"" << xml_escape(svg_root.attribute("height").as_string()) << "\"";
-  if (svg_root.attribute("viewBox")) out << " viewBox=\"" << xml_escape(svg_root.attribute("viewBox").as_string()) << "\"";
+  if (has_viewbox) {
+    if (needs_viewbox_normalize) {
+      out << " viewBox=\"0 0 " << fmt(vb_w) << " " << fmt(vb_h) << "\"";
+    } else {
+      out << " viewBox=\"" << xml_escape(svg_root.attribute("viewBox").as_string()) << "\"";
+    }
+  }
   out << ">\n";
 
   if (!serialized_defs.empty()) {
@@ -140,7 +188,7 @@ std::string render_svg_document(const pugi::xml_node& svg_root,
     out << "  </defs>\n";
   }
 
-  for (const PathEntry& entry : paths) {
+  for (const PathEntry& entry : output_paths) {
     out << render_path_entry(entry, fill_override);
   }
 
