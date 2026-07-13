@@ -2,6 +2,8 @@
 
 SVG Squisher is a native C++ SVG conversion tool for simplifying icon-style SVGs into clean output SVGs. It supports path and primitive conversion, text-to-path rendering, stroke flattening, transform handling, and batch processing for folders of SVG files.
 
+<a href="https://www.buymeacoffee.com/thestarduster" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+
 ## Features
 
 - Native C++17 executable
