@@ -8,7 +8,6 @@
 *.suo
 *.user
 /.claude
-/.github
 /.gitignore
 build/
 dist/
