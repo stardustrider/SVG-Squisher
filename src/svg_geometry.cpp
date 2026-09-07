@@ -25,28 +25,6 @@ bool is_command_char(char ch) {
   }
 }
 
-void skip_separators(const std::string& d, std::size_t& pos) {
-  while (pos < d.size()) {
-    const char ch = d[pos];
-    if (std::isspace(static_cast<unsigned char>(ch)) || ch == ',') {
-      ++pos;
-    } else {
-      break;
-    }
-  }
-}
-
-bool parse_number_token(const std::string& d, std::size_t& pos, double& out) {
-  skip_separators(d, pos);
-  if (pos >= d.size()) return false;
-  const char* start = d.c_str() + pos;
-  char* end = nullptr;
-  out = std::strtod(start, &end);
-  if (end == start) return false;
-  pos = static_cast<std::size_t>(end - d.c_str());
-  return true;
-}
-
 Point cubic_point(Point p0, Point p1, Point p2, Point p3, double t) {
   const double mt = 1.0 - t;
   const double mt2 = mt * mt;
@@ -165,6 +143,7 @@ std::vector<std::string> split_subpaths(const std::string& d) {
   while (true) {
     skip_separators(d, pos);
     if (pos >= d.size()) break;
+    const std::size_t iteration_start = pos;
 
     if (is_command_char(d[pos])) {
       cmd = d[pos++];
@@ -182,8 +161,11 @@ std::vector<std::string> split_subpaths(const std::string& d) {
         subpaths.push_back(trim(current));
         current.clear();
       }
+      if (pos == iteration_start) return {};
       continue;
     }
+
+    if (!next_is_number(pos)) return {};
 
     while (next_is_number(pos)) {
       double value = 0.0;
@@ -200,6 +182,7 @@ std::vector<std::string> split_subpaths(const std::string& d) {
       }
       if (pos < d.size()) current += " ";
     }
+    if (pos == iteration_start) return {};
   }
 
   if (!trim(current).empty()) subpaths.push_back(trim(current));
@@ -290,6 +273,7 @@ std::optional<std::vector<StrokeSubpath>> parse_straight_subpaths(const std::str
   while (true) {
     skip_separators(d, pos);
     if (pos >= d.size()) break;
+    const std::size_t iteration_start = pos;
 
     if (is_command_char(d[pos])) {
       cmd = d[pos++];
@@ -298,18 +282,21 @@ std::optional<std::vector<StrokeSubpath>> parse_straight_subpaths(const std::str
     }
 
     const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+    char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
 
     if (upper == 'Z') {
       active.closed = true;
       current = subpath_start;
       flush_active();
+      if (pos == iteration_start) return std::nullopt;
       continue;
     }
 
     if (upper != 'M' && upper != 'L' && upper != 'H' && upper != 'V') {
       return std::nullopt;
     }
+
+    if (!next_is_number(pos)) return std::nullopt;
 
     while (next_is_number(pos)) {
       if (upper == 'M') {
@@ -321,6 +308,7 @@ std::optional<std::vector<StrokeSubpath>> parse_straight_subpaths(const std::str
         subpath_start = current;
         active.points.push_back(current);
         cmd = relative ? 'l' : 'L';
+        upper = 'L';
       } else if (upper == 'L') {
         double x = 0.0, y = 0.0;
         if (!parse_number_token(d, pos, x) || !parse_number_token(d, pos, y)) return std::nullopt;
@@ -343,14 +331,18 @@ std::optional<std::vector<StrokeSubpath>> parse_straight_subpaths(const std::str
       skip_separators(d, pos);
       if (pos < d.size() && is_command_char(d[pos])) break;
     }
+    if (pos == iteration_start) return std::nullopt;
   }
 
   flush_active();
   return subpaths;
 }
 
-std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::string& d) {
+std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(
+    const std::string& d,
+    std::size_t* semantic_command_count) {
   std::vector<StrokeSubpath> subpaths;
+  std::size_t parsed_commands = 0;
   std::size_t pos = 0;
   char cmd = 0;
   char prev_cmd = 0;
@@ -360,6 +352,7 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
   Point last_quad_ctrl{0.0, 0.0};
   bool has_last_cubic = false;
   bool has_last_quad = false;
+  bool first_command = true;
   StrokeSubpath active;
 
   auto flush_active = [&]() {
@@ -387,6 +380,7 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
   while (true) {
     skip_separators(d, pos);
     if (pos >= d.size()) break;
+    const std::size_t iteration_start = pos;
 
     if (is_command_char(d[pos])) {
       cmd = d[pos++];
@@ -395,7 +389,8 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
     }
 
     const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+    char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+    if (first_command && upper != 'M') return std::nullopt;
 
     if (upper == 'Z') {
       active.closed = true;
@@ -404,8 +399,14 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
       has_last_cubic = false;
       has_last_quad = false;
       prev_cmd = 'Z';
+      ++parsed_commands;
+      first_command = false;
+      cmd = 0;
+      if (pos == iteration_start) return std::nullopt;
       continue;
     }
+
+    if (!next_is_number(pos)) return std::nullopt;
 
     while (next_is_number(pos)) {
       if (upper == 'M') {
@@ -417,6 +418,7 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
         subpath_start = current;
         push_point(current);
         cmd = relative ? 'l' : 'L';
+        upper = 'L';
         has_last_cubic = false;
         has_last_quad = false;
         prev_cmd = 'M';
@@ -508,14 +510,16 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
         has_last_cubic = false;
         prev_cmd = 'T';
       } else if (upper == 'A') {
-        double rx=0,ry=0,rot=0,large=0,sweep=0,x=0,y=0;
+        double rx=0,ry=0,rot=0,x=0,y=0;
+        int large=0,sweep=0;
         if (!parse_number_token(d,pos,rx) || !parse_number_token(d,pos,ry) ||
-            !parse_number_token(d,pos,rot) || !parse_number_token(d,pos,large) ||
-            !parse_number_token(d,pos,sweep) || !parse_number_token(d,pos,x) ||
+            !parse_number_token(d,pos,rot) || !parse_arc_flag(d,pos,large) ||
+            !parse_arc_flag(d,pos,sweep) || !parse_number_token(d,pos,x) ||
             !parse_number_token(d,pos,y)) return std::nullopt;
+        if (!valid_svg_arc_parameters(rx, ry, large, sweep)) return std::nullopt;
         if (relative) { x += current.x; y += current.y; }
         const Point end{x,y};
-        const auto arc_points = approximate_arc(current, rx, ry, rot, static_cast<int>(large), static_cast<int>(sweep), end);
+        const auto arc_points = approximate_arc(current, rx, ry, rot, large, sweep, end);
         active.points.insert(active.points.end(), arc_points.begin(), arc_points.end());
         current = end;
         has_last_cubic = false;
@@ -525,17 +529,23 @@ std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::strin
         return std::nullopt;
       }
 
+      ++parsed_commands;
+      first_command = false;
+
       skip_separators(d, pos);
       if (pos < d.size() && is_command_char(d[pos])) break;
     }
+    if (pos == iteration_start) return std::nullopt;
   }
 
   flush_active();
+  if (semantic_command_count) *semantic_command_count = parsed_commands;
   return subpaths;
 }
 
 std::string convert_evenodd_to_nonzero(const std::string& d) {
   const std::vector<std::string> subpaths = split_subpaths(d);
+  if (subpaths.empty()) return d;
   if (subpaths.size() <= 1) return d;
 
   const bool outer_cw = subpath_signed_area(subpaths.front()) >= 0.0;
@@ -569,6 +579,7 @@ std::optional<BBox> path_bbox(const std::string& d) {
   while (true) {
     skip_separators(d, pos);
     if (pos >= d.size()) break;
+    const std::size_t iteration_start = pos;
 
     if (is_command_char(d[pos])) {
       cmd = d[pos++];
@@ -577,8 +588,13 @@ std::optional<BBox> path_bbox(const std::string& d) {
     }
 
     const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
-    if (upper == 'Z') continue;
+    char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+    if (upper == 'Z') {
+      if (pos == iteration_start) return std::nullopt;
+      continue;
+    }
+
+    if (!next_is_number(pos)) return std::nullopt;
 
     while (next_is_number(pos)) {
       if (upper == 'M' || upper == 'L') {
@@ -587,6 +603,10 @@ std::optional<BBox> path_bbox(const std::string& d) {
         if (relative) { x += current.x; y += current.y; }
         current = {x, y};
         bbox_add_point(box, current);
+        if (upper == 'M') {
+          cmd = relative ? 'l' : 'L';
+          upper = 'L';
+        }
       } else if (upper == 'H') {
         double x = 0.0;
         if (!parse_number_token(d, pos, x)) return std::nullopt;
@@ -618,11 +638,13 @@ std::optional<BBox> path_bbox(const std::string& d) {
         current = {x,y};
         bbox_add_point(box, current);
       } else if (upper == 'A') {
-        double rx=0,ry=0,rot=0,large=0,sweep=0,x=0,y=0;
+        double rx=0,ry=0,rot=0,x=0,y=0;
+        int large=0,sweep=0;
         if (!parse_number_token(d,pos,rx) || !parse_number_token(d,pos,ry) ||
-            !parse_number_token(d,pos,rot) || !parse_number_token(d,pos,large) ||
-            !parse_number_token(d,pos,sweep) || !parse_number_token(d,pos,x) ||
+            !parse_number_token(d,pos,rot) || !parse_arc_flag(d,pos,large) ||
+            !parse_arc_flag(d,pos,sweep) || !parse_number_token(d,pos,x) ||
             !parse_number_token(d,pos,y)) return std::nullopt;
+        if (!valid_svg_arc_parameters(rx, ry, large, sweep)) return std::nullopt;
         if (relative) { x += current.x; y += current.y; }
         bbox_add_point(box, {x - rx, y - ry});
         bbox_add_point(box, {x + rx, y + ry});
@@ -634,6 +656,7 @@ std::optional<BBox> path_bbox(const std::string& d) {
       skip_separators(d, pos);
       if (pos < d.size() && is_command_char(d[pos])) break;
     }
+    if (pos == iteration_start) return std::nullopt;
   }
 
   if (!bbox_valid(box)) return std::nullopt;
@@ -651,4 +674,3 @@ bool bbox_contains(const std::optional<BBox>& outer,
 }
 
 }  // namespace svg_squisher
-

@@ -1,0 +1,23 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(@SVG_SQUISHER_USE_SYSTEM_DEPS@)
+  find_dependency(pugixml CONFIG)
+  find_dependency(Freetype)
+  find_dependency(harfbuzz CONFIG)
+else()
+  if(NOT TARGET pugixml::pugixml)
+    include("${CMAKE_CURRENT_LIST_DIR}/../pugixml/pugixml-config.cmake")
+  endif()
+  if(NOT TARGET freetype)
+    include("${CMAKE_CURRENT_LIST_DIR}/../freetype/freetype-config.cmake")
+  endif()
+  if(NOT TARGET harfbuzz::harfbuzz)
+    include("${CMAKE_CURRENT_LIST_DIR}/../harfbuzz/harfbuzzConfig.cmake")
+  endif()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SvgSquisherTargets.cmake")
+check_required_components(SvgSquisher)

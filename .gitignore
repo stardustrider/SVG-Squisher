@@ -8,9 +8,12 @@
 *.suo
 *.user
 /.claude
-/.gitignore
 build/
+build-*/
+benchmark-report*.json
 dist/
+node_modules/
+visual-diffs/
 out/
 svgs-out/
 svgs/

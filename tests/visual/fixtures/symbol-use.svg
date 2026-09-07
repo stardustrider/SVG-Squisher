@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <symbol id="diamond" viewBox="0 0 20 20">
+      <path d="M10 1L19 10L10 19L1 10Z" fill="#36a8a1"/>
+    </symbol>
+  </defs>
+  <use href="#diamond" x="10" y="10" width="80" height="80"/>
+</svg>

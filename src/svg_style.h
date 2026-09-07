@@ -21,6 +21,8 @@ struct StyleState {
   std::string stroke_miterlimit = "4";
   std::string fill_rule = "nonzero";
   std::string opacity = "1";
+  std::string display = "inline";
+  std::string visibility = "visible";
   std::string font_size = "16";
   std::string font_family;
   std::string font_weight = "400";
@@ -40,4 +42,3 @@ StyleState resolve_style(const pugi::xml_node& node,
                          const StyleState& inherited);
 
 }  // namespace svg_squisher
-

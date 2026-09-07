@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Geijoh/SVG-Squisher/blob/main/docs/report-schema-v1.json",
+  "title": "SVG Squisher conversion report",
+  "description": "Schema version 1 report emitted by svg_squisher --report.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "generator",
+    "generatorVersion",
+    "pathBase",
+    "options",
+    "summary",
+    "files"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "generator": {
+      "const": "SVG Squisher"
+    },
+    "generatorVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Converter version that produced the report."
+    },
+    "pathBase": {
+      "const": "page",
+      "description": "File paths resolve relative to the report document URL."
+    },
+    "options": {
+      "type": "object",
+      "required": [
+        "strict",
+        "recursive",
+        "continueOnError",
+        "removeBackground",
+        "overwrite",
+        "allowInPlace",
+        "precision",
+        "fill",
+        "font"
+      ],
+      "properties": {
+        "strict": { "type": "boolean" },
+        "recursive": { "type": "boolean" },
+        "continueOnError": { "type": "boolean" },
+        "removeBackground": { "type": "boolean" },
+        "overwrite": { "type": "boolean" },
+        "allowInPlace": { "type": "boolean" },
+        "precision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "fill": {
+          "type": ["string", "null"]
+        },
+        "font": {
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    }
+  },
+  "$defs": {
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "summary": {
+      "type": "object",
+      "required": ["converted", "failed", "skipped", "warnings"],
+      "properties": {
+        "converted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "failed": { "$ref": "#/$defs/nonNegativeInteger" },
+        "skipped": { "$ref": "#/$defs/nonNegativeInteger" },
+        "warnings": { "$ref": "#/$defs/nonNegativeInteger" }
+      },
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["severity", "code", "message", "element"],
+      "properties": {
+        "severity": {
+          "enum": ["warning", "error"]
+        },
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "element": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "file": {
+      "type": "object",
+      "required": [
+        "input",
+        "output",
+        "status",
+        "error",
+        "inputBytes",
+        "outputBytes",
+        "inputElements",
+        "outputPaths",
+        "inputPathCommands",
+        "outputPathCommands",
+        "missingGlyphs",
+        "fonts",
+        "fontIdentities",
+        "diagnostics"
+      ],
+      "properties": {
+        "input": { "type": "string" },
+        "output": { "type": "string" },
+        "status": {
+          "enum": ["converted", "failed", "skipped"]
+        },
+        "error": {
+          "type": ["string", "null"]
+        },
+        "inputBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "outputBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "inputElements": { "$ref": "#/$defs/nonNegativeInteger" },
+        "outputPaths": { "$ref": "#/$defs/nonNegativeInteger" },
+        "inputPathCommands": { "$ref": "#/$defs/nonNegativeInteger" },
+        "outputPathCommands": { "$ref": "#/$defs/nonNegativeInteger" },
+        "missingGlyphs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "fonts": {
+          "type": "array",
+          "description": "Actual font file paths used while converting this input.",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "fontIdentities": {
+          "type": "array",
+          "description": "Byte-level identities for the exact font files used. Null size/hash values and a non-null error mean identity capture failed.",
+          "items": {
+            "$ref": "#/$defs/fontIdentity"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "fontIdentity": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256", "error"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "UTF-8 path matching the corresponding legacy fonts entry."
+        },
+        "bytes": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonNegativeInteger" },
+            { "type": "null" }
+          ]
+        },
+        "sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "error": {
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

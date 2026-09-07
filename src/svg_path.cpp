@@ -1,5 +1,6 @@
 ﻿#include "svg_path.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -25,39 +26,21 @@ bool is_command_char(char ch) {
   }
 }
 
-void skip_separators(const std::string& d, std::size_t& pos) {
-  while (pos < d.size()) {
-    const char ch = d[pos];
-    if (std::isspace(static_cast<unsigned char>(ch)) || ch == ',') {
-      ++pos;
-    } else {
-      break;
-    }
-  }
-}
-
-bool parse_number_token(const std::string& d, std::size_t& pos, double& out) {
-  skip_separators(d, pos);
-  if (pos >= d.size()) return false;
-  const char* start = d.c_str() + pos;
-  char* end = nullptr;
-  out = std::strtod(start, &end);
-  if (end == start) return false;
-  pos = static_cast<std::size_t>(end - d.c_str());
-  return true;
-}
-
-std::string append_line_or_arc(std::string d, const Point& from, const Point& to, bool arc, int sweep, double radius) {
-  (void)from;
-  if (arc) {
-    d += "A" + fmt(radius) + "," + fmt(radius) + " 0 0 " + std::to_string(sweep) + " " + fmt(to.x) + "," + fmt(to.y);
-  } else {
-    d += "L" + fmt(to.x) + "," + fmt(to.y);
-  }
-  return d;
+bool paint_uses_url(const std::string& paint) {
+  const std::string normalized = lower_copy(trim(paint));
+  return normalized.rfind("url(", 0) == 0;
 }
 
 }  // namespace
+
+bool path_data_is_valid(const std::string& d) {
+  return flatten_path_subpaths(d).has_value();
+}
+
+std::size_t count_path_commands(const std::string& d) {
+  std::size_t count = 0;
+  return flatten_path_subpaths(d, &count).has_value() ? count : 0;
+}
 
 std::optional<std::string> bake_path_transform(const std::string& d, const Matrix& matrix) {
   if (matrix_is_identity(matrix)) return d;
@@ -83,6 +66,7 @@ std::optional<std::string> bake_path_transform(const std::string& d, const Matri
   while (true) {
     skip_separators(d, pos);
     if (pos >= d.size()) break;
+    const std::size_t iteration_start = pos;
 
     if (is_command_char(d[pos])) {
       cmd = d[pos++];
@@ -91,7 +75,7 @@ std::optional<std::string> bake_path_transform(const std::string& d, const Matri
     }
 
     const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+    char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
 
     if (upper == 'Z') {
       out += "Z";
@@ -99,8 +83,11 @@ std::optional<std::string> bake_path_transform(const std::string& d, const Matri
       has_last_cubic = false;
       has_last_quad = false;
       prev_cmd = upper;
+      if (pos == iteration_start) return std::nullopt;
       continue;
     }
+
+    if (!next_is_number(pos)) return std::nullopt;
 
     while (next_is_number(pos)) {
       if (upper == 'M') {
@@ -114,6 +101,7 @@ std::optional<std::string> bake_path_transform(const std::string& d, const Matri
         subpath_start = current;
         out += append_point_cmd('M', apply_matrix(matrix, current));
         cmd = relative ? 'l' : 'L';
+        upper = 'L';
         prev_cmd = 'M';
         has_last_cubic = false;
         has_last_quad = false;
@@ -228,24 +216,35 @@ std::optional<std::string> bake_path_transform(const std::string& d, const Matri
         has_last_cubic = false;
         prev_cmd = 'T';
       } else if (upper == 'A') {
-        double rx = 0.0, ry = 0.0, rot = 0.0, large_arc = 0.0, sweep = 0.0, x = 0.0, y = 0.0;
+        double rx = 0.0, ry = 0.0, rot = 0.0, x = 0.0, y = 0.0;
+        int large_arc = 0, sweep = 0;
         if (!parse_number_token(d, pos, rx) || !parse_number_token(d, pos, ry) ||
-            !parse_number_token(d, pos, rot) || !parse_number_token(d, pos, large_arc) ||
-            !parse_number_token(d, pos, sweep) || !parse_number_token(d, pos, x) ||
+            !parse_number_token(d, pos, rot) || !parse_arc_flag(d, pos, large_arc) ||
+            !parse_arc_flag(d, pos, sweep) || !parse_number_token(d, pos, x) ||
             !parse_number_token(d, pos, y)) {
           return std::nullopt;
         }
+        if (!valid_svg_arc_parameters(rx, ry, large_arc, sweep)) return std::nullopt;
         if (relative) {
           x += current.x; y += current.y;
         }
         if (!matrix_is_scale_translate_only(matrix)) return std::nullopt;
         const double sx = std::abs(matrix.a);
         const double sy = std::abs(matrix.d);
+        const double normalized_rotation = std::fmod(std::abs(rot), 180.0);
+        const bool arc_axes_match_coordinates =
+          normalized_rotation <= 1e-9 || std::abs(normalized_rotation - 180.0) <= 1e-9;
+        if (matrix.a <= 0.0 || matrix.d <= 0.0 ||
+            (std::abs(sx - sy) > 1e-9 && !arc_axes_match_coordinates)) {
+          // Reflections and non-uniform scaling of rotated elliptical arcs require
+          // re-solving the ellipse parameters. Preserve the SVG transform instead.
+          return std::nullopt;
+        }
         current = {x, y};
         const Point p = apply_matrix(matrix, current);
-        const int sweep_flag = (matrix.a * matrix.d < 0.0) ? (static_cast<int>(sweep) ? 0 : 1) : static_cast<int>(sweep);
+        const int sweep_flag = (matrix.a * matrix.d < 0.0) ? (sweep ? 0 : 1) : sweep;
         out += "A" + fmt(rx * sx) + "," + fmt(ry * sy) + " " + fmt(rot) + " " +
-               std::to_string(static_cast<int>(large_arc)) + " " + std::to_string(sweep_flag) + " " +
+               std::to_string(large_arc) + " " + std::to_string(sweep_flag) + " " +
                fmt(p.x) + "," + fmt(p.y);
         has_last_cubic = false;
         has_last_quad = false;
@@ -256,6 +255,7 @@ std::optional<std::string> bake_path_transform(const std::string& d, const Matri
       skip_separators(d, pos);
       if (pos < d.size() && is_command_char(d[pos])) break;
     }
+    if (pos == iteration_start) return std::nullopt;
   }
 
   return out;
@@ -295,13 +295,20 @@ void append_path_entry(std::vector<PathEntry>& out_paths,
   if ((!emit_fill && !emit_stroke) || d.empty()) return;
 
   const Matrix matrix = parse_transform(transform);
-  const std::optional<std::string> baked = bake_path_transform(d, matrix);
+  const bool uses_coordinate_dependent_paint =
+    (emit_fill && paint_uses_url(fill)) || (emit_stroke && paint_uses_url(stroke));
+  const bool retain_transform =
+    !matrix_is_identity(matrix) && (emit_stroke || uses_coordinate_dependent_paint);
+  const std::optional<std::string> baked =
+    retain_transform ? std::nullopt : bake_path_transform(d, matrix);
 
   PathEntry entry;
   entry.d = baked.value_or(d);
   entry.transform = baked ? "" : transform;
   entry.fill = fill;
+  entry.fill_opacity = style.fill_opacity;
   entry.stroke = stroke;
+  entry.stroke_opacity = style.stroke_opacity;
   entry.stroke_width = style.stroke_width;
   entry.stroke_dasharray = style.stroke_dasharray;
   entry.stroke_linecap = style.stroke_linecap;
@@ -315,4 +322,3 @@ void append_path_entry(std::vector<PathEntry>& out_paths,
 }
 
 }  // namespace svg_squisher
-

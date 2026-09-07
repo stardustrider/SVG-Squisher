@@ -37,8 +37,8 @@ struct EntryMeta {
 
 std::vector<PathEntry> prepare_output_paths(const pugi::xml_node& svg_node,
                                             const std::vector<PathEntry>& paths,
-                                            const std::optional<std::string>& fill_override) {
-  if (!fill_override.has_value()) return paths;
+                                            bool remove_background) {
+  if (!remove_background) return paths;
 
   const auto view_size = parse_viewbox_size(svg_node);
   const double view_area = view_size ? view_size->first * view_size->second : 0.0;
@@ -89,14 +89,9 @@ std::vector<PathEntry> prepare_output_paths(const pugi::xml_node& svg_node,
   std::vector<PathEntry> final_paths;
   final_paths.reserve(kept.size());
   for (EntryMeta& meta : kept) {
-    meta.entry.opacity = "1";
-    if (meta.entry.emit_fill && meta.entry.fill_rule.empty()) {
-      meta.entry.fill_rule = "nonzero";
-    }
     final_paths.push_back(std::move(meta.entry));
   }
   return final_paths;
 }
 
 }  // namespace svg_squisher
-

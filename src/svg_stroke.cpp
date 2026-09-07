@@ -26,28 +26,6 @@ bool is_command_char(char ch) {
   }
 }
 
-void skip_separators(const std::string& d, std::size_t& pos) {
-  while (pos < d.size()) {
-    const char ch = d[pos];
-    if (std::isspace(static_cast<unsigned char>(ch)) || ch == ',') {
-      ++pos;
-    } else {
-      break;
-    }
-  }
-}
-
-bool parse_number_token(const std::string& d, std::size_t& pos, double& out) {
-  skip_separators(d, pos);
-  if (pos >= d.size()) return false;
-  const char* start = d.c_str() + pos;
-  char* end = nullptr;
-  out = std::strtod(start, &end);
-  if (end == start) return false;
-  pos = static_cast<std::size_t>(end - d.c_str());
-  return true;
-}
-
 struct OutlineStep {
   Point point;
   bool arc = false;
@@ -375,6 +353,7 @@ struct OffsetCurveSegment {
   Point p1{};
   Point p2{};
   Point p3{};
+  CurveSegment source{};
 };
 
 struct ArcCenterParams {
@@ -628,7 +607,7 @@ OffsetCurveSegment offset_curve_segment_once(const CurveSegment& segment, double
   if (segment.kind == CurveKind::Line) {
     const Point tangent = curve_start_tangent(segment);
     const Point normal = left_normal(tangent, offset);
-    return {CurveKind::Line, segment.p0 + normal, segment.p1 + normal, {}, {}};
+    return {CurveKind::Line, segment.p0 + normal, segment.p1 + normal, {}, {}, segment};
   }
 
   if (segment.kind == CurveKind::Quadratic) {
@@ -642,7 +621,7 @@ OffsetCurveSegment offset_curve_segment_once(const CurveSegment& segment, double
       segment.p1 + n12,
       segment.p2 + n12,
       segment.p1 + Point{(n01.x + n12.x) * 0.5, (n01.y + n12.y) * 0.5});
-    return {CurveKind::Quadratic, q0, q1, q2, {}};
+    return {CurveKind::Quadratic, q0, q1, q2, {}, segment};
   }
 
   const Point n01 = left_normal(normalize_or_zero(segment.p1 - segment.p0), offset);
@@ -662,7 +641,7 @@ OffsetCurveSegment offset_curve_segment_once(const CurveSegment& segment, double
     segment.p2 + n23,
     segment.p3 + n23,
     segment.p2 + Point{(n12.x + n23.x) * 0.5, (n12.y + n23.y) * 0.5});
-  return {CurveKind::Cubic, q0, q1, q2, q3};
+  return {CurveKind::Cubic, q0, q1, q2, q3, segment};
 }
 
 void append_offset_curve_segments(const CurveSegment& segment,
@@ -717,6 +696,7 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
   while (true) {
     skip_separators(d, pos);
     if (pos >= d.size()) break;
+    const std::size_t iteration_start = pos;
 
     if (is_command_char(d[pos])) {
       cmd = d[pos++];
@@ -725,7 +705,7 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
     }
 
     const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+    char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
 
     if (upper == 'Z') {
       active.closed = true;
@@ -734,8 +714,11 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
       has_last_cubic = false;
       has_last_quad = false;
       prev_cmd = 'Z';
+      if (pos == iteration_start) return std::nullopt;
       continue;
     }
+
+    if (!next_is_number(pos)) return std::nullopt;
 
     while (next_is_number(pos)) {
       if (upper == 'M') {
@@ -746,6 +729,7 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
         current = {x, y};
         subpath_start = current;
         cmd = relative ? 'l' : 'L';
+        upper = 'L';
         has_last_cubic = false;
         has_last_quad = false;
         prev_cmd = 'M';
@@ -840,15 +824,17 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
         has_last_quad = false;
         prev_cmd = 'S';
       } else if (upper == 'A') {
-        double rx = 0.0, ry = 0.0, rot = 0.0, large = 0.0, sweep = 0.0, x = 0.0, y = 0.0;
+        double rx = 0.0, ry = 0.0, rot = 0.0, x = 0.0, y = 0.0;
+        int large = 0, sweep = 0;
         if (!parse_number_token(d, pos, rx) || !parse_number_token(d, pos, ry) ||
-            !parse_number_token(d, pos, rot) || !parse_number_token(d, pos, large) ||
-            !parse_number_token(d, pos, sweep) || !parse_number_token(d, pos, x) ||
+            !parse_number_token(d, pos, rot) || !parse_arc_flag(d, pos, large) ||
+            !parse_arc_flag(d, pos, sweep) || !parse_number_token(d, pos, x) ||
             !parse_number_token(d, pos, y)) return std::nullopt;
+        if (!valid_svg_arc_parameters(rx, ry, large, sweep)) return std::nullopt;
         if (relative) { x += current.x; y += current.y; }
         const Point next{x, y};
         for (const CurveSegment& segment : arc_to_curve_segments(
-               current, rx, ry, rot, static_cast<int>(large), static_cast<int>(sweep), next)) {
+               current, rx, ry, rot, large, sweep, next)) {
           active.segments.push_back(segment);
         }
         current = next;
@@ -862,6 +848,7 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
       skip_separators(d, pos);
       if (pos < d.size() && is_command_char(d[pos])) break;
     }
+    if (pos == iteration_start) return std::nullopt;
   }
 
   flush_active();
@@ -995,9 +982,9 @@ std::string build_open_curve_outline(const CurveSubpath& subpath,
       d,
       offset_segment_end(left_segments[i - 1]),
       offset_segment_start(left_segments[i]),
-      subpath.segments[i].p0,
-      curve_end_tangent(subpath.segments[i - 1]),
-      curve_start_tangent(subpath.segments[i]),
+      left_segments[i].source.p0,
+      curve_end_tangent(left_segments[i - 1].source),
+      curve_start_tangent(left_segments[i].source),
       1,
       linejoin,
       half_width,
@@ -1021,9 +1008,9 @@ std::string build_open_curve_outline(const CurveSubpath& subpath,
         d,
         offset_segment_start(right_segments[i + 1]),
         offset_segment_end(right_segments[i]),
-        subpath.segments[i + 1].p0,
-        curve_start_tangent(subpath.segments[i + 1]),
-        curve_end_tangent(subpath.segments[i]),
+        right_segments[i + 1].source.p0,
+        curve_start_tangent(right_segments[i + 1].source),
+        curve_end_tangent(right_segments[i].source),
         -1,
         linejoin,
         half_width,
@@ -1061,9 +1048,9 @@ std::string build_closed_curve_outline(const CurveSubpath& subpath,
       d,
       offset_segment_end(left_segments[i - 1]),
       offset_segment_start(left_segments[i]),
-      subpath.segments[i].p0,
-      curve_end_tangent(subpath.segments[i - 1]),
-      curve_start_tangent(subpath.segments[i]),
+      left_segments[i].source.p0,
+      curve_end_tangent(left_segments[i - 1].source),
+      curve_start_tangent(left_segments[i].source),
       1,
       linejoin,
       half_width,
@@ -1074,9 +1061,9 @@ std::string build_closed_curve_outline(const CurveSubpath& subpath,
     d,
     offset_segment_end(left_segments.back()),
     offset_segment_start(left_segments.front()),
-    subpath.segments.front().p0,
-    curve_end_tangent(subpath.segments.back()),
-    curve_start_tangent(subpath.segments.front()),
+    left_segments.front().source.p0,
+    curve_end_tangent(left_segments.back().source),
+    curve_start_tangent(left_segments.front().source),
     1,
     linejoin,
     half_width,
@@ -1092,9 +1079,9 @@ std::string build_closed_curve_outline(const CurveSubpath& subpath,
         d,
         offset_segment_start(right_segments[i]),
         offset_segment_end(right_segments[i - 1]),
-        subpath.segments[i].p0,
-        curve_start_tangent(subpath.segments[i]) * -1.0,
-        curve_end_tangent(subpath.segments[i - 1]) * -1.0,
+        right_segments[i].source.p0,
+        curve_start_tangent(right_segments[i].source) * -1.0,
+        curve_end_tangent(right_segments[i - 1].source) * -1.0,
         -1,
         linejoin,
         half_width,
@@ -1105,9 +1092,9 @@ std::string build_closed_curve_outline(const CurveSubpath& subpath,
     d,
     offset_segment_start(right_segments.front()),
     offset_segment_end(right_segments.back()),
-    subpath.segments.front().p0,
-    curve_start_tangent(subpath.segments.front()) * -1.0,
-    curve_end_tangent(subpath.segments.back()) * -1.0,
+    right_segments.front().source.p0,
+    curve_start_tangent(right_segments.front().source) * -1.0,
+    curve_end_tangent(right_segments.back().source) * -1.0,
     -1,
     linejoin,
     half_width,
@@ -1190,4 +1177,3 @@ std::string build_curve_fallback_outline(const std::string& d,
 }
 
 }  // namespace svg_squisher
-

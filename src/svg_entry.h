@@ -17,6 +17,10 @@ struct PathPaintInfo {
 struct PathEntryAnalysis {
   double opacity = 1.0;
   bool has_non_default_opacity = false;
+  double fill_opacity = 1.0;
+  double stroke_opacity = 1.0;
+  bool has_non_default_fill_opacity = false;
+  bool has_non_default_stroke_opacity = false;
   bool is_stroke_shape = false;
   StrokeLineCap stroke_linecap = StrokeLineCap::Butt;
   StrokeLineJoin stroke_linejoin = StrokeLineJoin::Miter;
@@ -31,4 +35,3 @@ struct PathEntryAnalysis {
 PathEntryAnalysis analyze_path_entry(const PathEntry& entry);
 
 }  // namespace svg_squisher
-

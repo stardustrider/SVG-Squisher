@@ -7,7 +7,8 @@ namespace svg_squisher {
 ParsedPaint parse_paint(const std::string& paint, double opacity) {
   ParsedPaint parsed;
   parsed.raw = paint;
-  parsed.normalized = lower_copy(trim(paint));
+  const std::string trimmed = trim(paint);
+  parsed.normalized = lower_copy(trimmed);
 
   if (parsed.normalized.empty() || parsed.normalized == "none" || opacity <= 1e-6) {
     parsed.kind = PaintKind::None;
@@ -15,14 +16,21 @@ ParsedPaint parse_paint(const std::string& paint, double opacity) {
     return parsed;
   }
 
-  if (parsed.normalized.size() >= 7 && parsed.normalized.rfind("url(", 0) == 0) {
-    const std::size_t hash = parsed.normalized.find('#');
-    const std::size_t close = parsed.normalized.rfind(')');
-    if (hash != std::string::npos && close != std::string::npos && hash + 1 < close) {
-      parsed.kind = PaintKind::Url;
-      parsed.url_id = parsed.normalized.substr(hash + 1, close - hash - 1);
-      parsed.visible = true;
-      return parsed;
+  if (parsed.normalized.size() >= 6 && parsed.normalized.rfind("url(", 0) == 0) {
+    const std::size_t close = trimmed.find(')', 4);
+    if (close != std::string::npos) {
+      std::string target = trim(trimmed.substr(4, close - 4));
+      if (target.size() >= 2 &&
+          ((target.front() == '\'' && target.back() == '\'') ||
+           (target.front() == '"' && target.back() == '"'))) {
+        target = trim(target.substr(1, target.size() - 2));
+      }
+      if (target.size() > 1 && target.front() == '#') {
+        parsed.kind = PaintKind::Url;
+        parsed.url_id = target.substr(1);
+        parsed.visible = true;
+        return parsed;
+      }
     }
   }
 
@@ -56,4 +64,3 @@ std::optional<double> paint_brightness(const std::string& paint) {
 }
 
 }  // namespace svg_squisher
-
