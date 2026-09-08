@@ -1,16 +1,28 @@
 ﻿#pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace svg_squisher {
 
+enum class ConversionPolicy {
+  PreserveAppearance,
+  FilledPaths,
+};
+
+constexpr const char* conversion_policy_name(ConversionPolicy policy) noexcept {
+  return policy == ConversionPolicy::FilledPaths ? "filled-paths" : "preserve-appearance";
+}
+
 struct Options {
   std::optional<std::string> fill_override;
   std::optional<std::string> font_path;
+  ConversionPolicy conversion_policy = ConversionPolicy::PreserveAppearance;
   bool remove_background = false;
   bool strict = false;
   bool recursive = false;

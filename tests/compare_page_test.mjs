@@ -113,6 +113,7 @@ test("sample manifest resolves file paths from its own report location", async (
   assert.match(report.generatorVersion, /^\d+\.\d+\.\d+(?:[-+].*)?$/u);
   assert.equal(report.pathBase, "page");
   assert.ok(Array.isArray(report.files));
+  assert.equal(report.options.conversionPolicy, "preserve-appearance");
   assert.equal(report.options.continueOnError, true);
   assert.equal(report.options.allowInPlace, false);
   assert.equal(report.options.precision, 3);
@@ -151,6 +152,21 @@ test("sample manifest resolves file paths from its own report location", async (
   assert.match(page, /flags\.fontIdentityWarning/u);
   assert.match(page, /buildManifestRows\(report, manifestUrl\)/u);
   assert.match(page, /entryFromManifestPath\(record\.input, manifestUrl\)/u);
+});
+
+test("report options are shown through a complete allowlisted text-only panel", async () => {
+  assert.match(page, /function createReportOptions\(options\)/u);
+  assert.match(page, /Object\.prototype\.hasOwnProperty\.call\(options, key\)/u);
+  assert.match(page, /createReportOptions\(manifest\.report\.options\)/u);
+  assert.match(page, /appendTextElement\(item, "dd", rendered\)/u);
+
+  const listStart = page.indexOf("const knownOptions = [");
+  const listEnd = page.indexOf("];", listStart);
+  assert.ok(listStart >= 0 && listEnd > listStart, "expected the report option allowlist");
+  const allowlistedKeys = [...page.slice(listStart, listEnd).matchAll(/\["([^"]+)",\s*"[^"]+"\]/gu)]
+    .map((match) => match[1]);
+  const schema = JSON.parse(await readFile(path.join(repositoryRoot, "docs", "report-schema-v1.json"), "utf8"));
+  assert.deepEqual(allowlistedKeys, schema.properties.options.required);
 });
 
 test("report schema defines complete SHA-256 font identities", async () => {

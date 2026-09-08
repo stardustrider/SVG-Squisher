@@ -2,29 +2,17 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
-#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "svg_geometry.h"
+#include "svg_path_data.h"
 #include "svg_util.h"
 
 namespace svg_squisher {
 namespace {
-
-bool is_command_char(char ch) {
-  switch (ch) {
-    case 'M': case 'm': case 'L': case 'l': case 'H': case 'h': case 'V': case 'v':
-    case 'C': case 'c': case 'S': case 's': case 'Q': case 'q': case 'T': case 't':
-    case 'A': case 'a': case 'Z': case 'z':
-      return true;
-    default:
-      return false;
-  }
-}
 
 struct OutlineStep {
   Point point;
@@ -38,6 +26,133 @@ struct StrokeSegment {
   Point dir;
   Point normal;
 };
+
+bool points_equal(Point left, Point right) {
+  return left.x == right.x && left.y == right.y;
+}
+
+std::string build_zero_length_cap(Point center,
+                                  double half_width,
+                                  const std::string& linecap) {
+  if (half_width <= 0.0 || linecap == "butt") return "";
+
+  if (linecap == "round") {
+    const Point left{center.x - half_width, center.y};
+    const Point right{center.x + half_width, center.y};
+    return "M" + fmt(left.x) + "," + fmt(left.y) +
+           "A" + fmt(half_width) + "," + fmt(half_width) + " 0 1 0 " +
+           fmt(right.x) + "," + fmt(right.y) +
+           "A" + fmt(half_width) + "," + fmt(half_width) + " 0 1 0 " +
+           fmt(left.x) + "," + fmt(left.y) + "Z";
+  }
+
+  if (linecap == "square") {
+    const double left = center.x - half_width;
+    const double top = center.y - half_width;
+    const double right = center.x + half_width;
+    const double bottom = center.y + half_width;
+    return "M" + fmt(left) + "," + fmt(top) +
+           "L" + fmt(right) + "," + fmt(top) +
+           "L" + fmt(right) + "," + fmt(bottom) +
+           "L" + fmt(left) + "," + fmt(bottom) + "Z";
+  }
+
+  return "";
+}
+
+bool is_zero_length_subpath(const StrokeSubpath& subpath) {
+  if (subpath.points.empty() || (subpath.points.size() == 1 && !subpath.closed)) {
+    return false;
+  }
+  return std::all_of(subpath.points.begin() + 1, subpath.points.end(),
+                     [&](Point point) {
+                       return points_equal(point, subpath.points.front());
+                     });
+}
+
+std::string build_segment_outline(Point start,
+                                  Point end,
+                                  double half_width,
+                                  const std::string& start_cap,
+                                  const std::string& end_cap) {
+  const Point delta = end - start;
+  const double length = point_length(delta);
+  if (length <= 1e-9 || half_width <= 0.0) return "";
+
+  const Point direction{delta.x / length, delta.y / length};
+  const Point normal{-direction.y * half_width, direction.x * half_width};
+  Point left_start = start + normal;
+  Point right_start = start - normal;
+  Point left_end = end + normal;
+  Point right_end = end - normal;
+
+  if (start_cap == "square") {
+    const Point extension = direction * -half_width;
+    left_start = left_start + extension;
+    right_start = right_start + extension;
+  }
+  if (end_cap == "square") {
+    const Point extension = direction * half_width;
+    left_end = left_end + extension;
+    right_end = right_end + extension;
+  }
+
+  std::string outline;
+  if (start_cap == "round") {
+    outline = "M" + fmt(right_start.x) + "," + fmt(right_start.y) +
+              "A" + fmt(half_width) + "," + fmt(half_width) + " 0 0 0 " +
+              fmt(left_start.x) + "," + fmt(left_start.y);
+  } else {
+    outline = "M" + fmt(left_start.x) + "," + fmt(left_start.y);
+  }
+
+  outline += "L" + fmt(left_end.x) + "," + fmt(left_end.y);
+  if (end_cap == "round") {
+    outline += "A" + fmt(half_width) + "," + fmt(half_width) + " 0 0 0 " +
+               fmt(right_end.x) + "," + fmt(right_end.y);
+  } else {
+    outline += "L" + fmt(right_end.x) + "," + fmt(right_end.y);
+  }
+  outline += "L" + fmt(right_start.x) + "," + fmt(right_start.y) + "Z";
+  return outline;
+}
+
+std::optional<std::string> build_two_segment_retrace_outline(
+    const StrokeSubpath& subpath,
+    double half_width,
+    const std::string& linecap,
+    const std::string& linejoin) {
+  if (subpath.closed || subpath.points.size() != 3 ||
+      !points_equal(subpath.points.front(), subpath.points.back()) ||
+      points_equal(subpath.points.front(), subpath.points[1])) {
+    return std::nullopt;
+  }
+
+  // A path that immediately retraces one complete segment has a zero-area
+  // centerline loop. Building its two sides as one polygon makes those sides
+  // cross and cancel. Its painted region is the original segment with the
+  // line cap at the coincident path endpoints and the line join at the turn.
+  const std::string join_cap = linejoin == "round" ? "round" : "butt";
+  return build_segment_outline(
+      subpath.points.front(), subpath.points[1], half_width, linecap, join_cap);
+}
+
+bool has_immediate_direction_reversal(const StrokeSubpath& subpath) {
+  std::optional<Point> previous_direction;
+  for (std::size_t index = 1; index < subpath.points.size(); ++index) {
+    const Point delta = subpath.points[index] - subpath.points[index - 1];
+    const double length = point_length(delta);
+    if (length <= 1e-9) continue;
+    const Point direction{delta.x / length, delta.y / length};
+    if (previous_direction) {
+      const double dot = previous_direction->x * direction.x +
+                         previous_direction->y * direction.y;
+      if (dot <= -1.0 + 1e-9) return true;
+    }
+    previous_direction = direction;
+  }
+  return false;
+}
 
 std::string append_line_or_arc(std::string d, const Point& from, const Point& to, bool arc, int sweep, double radius) {
   (void)from;
@@ -346,6 +461,40 @@ struct CurveSubpath {
   std::vector<CurveSegment> segments;
   bool closed = false;
 };
+
+Point curve_segment_end(const CurveSegment& segment) {
+  switch (segment.kind) {
+    case CurveKind::Line: return segment.p1;
+    case CurveKind::Quadratic: return segment.p2;
+    case CurveKind::Cubic: return segment.p3;
+  }
+  return segment.p0;
+}
+
+bool is_zero_length_segment(const CurveSegment& segment, Point center) {
+  if (!points_equal(segment.p0, center)) return false;
+  switch (segment.kind) {
+    case CurveKind::Line:
+      return points_equal(segment.p1, center);
+    case CurveKind::Quadratic:
+      return points_equal(segment.p1, center) &&
+             points_equal(segment.p2, center);
+    case CurveKind::Cubic:
+      return points_equal(segment.p1, center) &&
+             points_equal(segment.p2, center) &&
+             points_equal(segment.p3, center);
+  }
+  return false;
+}
+
+bool is_zero_length_subpath(const CurveSubpath& subpath) {
+  if (subpath.segments.empty()) return false;
+  const Point center = subpath.segments.front().p0;
+  return std::all_of(subpath.segments.begin(), subpath.segments.end(),
+                     [&](const CurveSegment& segment) {
+                       return is_zero_length_segment(segment, center);
+                     });
+}
 
 struct OffsetCurveSegment {
   CurveKind kind = CurveKind::Line;
@@ -667,18 +816,11 @@ void append_offset_curve_segments(const CurveSegment& segment,
 }
 
 std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string& d) {
-  std::vector<CurveSubpath> subpaths;
-  std::size_t pos = 0;
-  char cmd = 0;
-  char prev_cmd = 0;
-  Point current{0.0, 0.0};
-  Point subpath_start{0.0, 0.0};
-  Point last_cubic_ctrl{0.0, 0.0};
-  Point last_quad_ctrl{0.0, 0.0};
-  bool has_last_cubic = false;
-  bool has_last_quad = false;
-  CurveSubpath active;
+  const auto parsed = parse_path_data(d);
+  if (!parsed) return std::nullopt;
 
+  std::vector<CurveSubpath> subpaths;
+  CurveSubpath active;
   auto flush_active = [&]() {
     if (!active.segments.empty()) {
       subpaths.push_back(active);
@@ -686,171 +828,49 @@ std::optional<std::vector<CurveSubpath>> parse_curve_subpaths(const std::string&
     }
   };
 
-  auto next_is_number = [&](std::size_t cursor) {
-    skip_separators(d, cursor);
-    if (cursor >= d.size()) return false;
-    const char ch = d[cursor];
-    return std::isdigit(static_cast<unsigned char>(ch)) || ch == '-' || ch == '+' || ch == '.';
-  };
-
-  while (true) {
-    skip_separators(d, pos);
-    if (pos >= d.size()) break;
-    const std::size_t iteration_start = pos;
-
-    if (is_command_char(d[pos])) {
-      cmd = d[pos++];
-    } else if (cmd == 0) {
-      return std::nullopt;
-    }
-
-    const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
-
-    if (upper == 'Z') {
-      active.closed = true;
-      current = subpath_start;
-      flush_active();
-      has_last_cubic = false;
-      has_last_quad = false;
-      prev_cmd = 'Z';
-      if (pos == iteration_start) return std::nullopt;
-      continue;
-    }
-
-    if (!next_is_number(pos)) return std::nullopt;
-
-    while (next_is_number(pos)) {
-      if (upper == 'M') {
-        double x = 0.0, y = 0.0;
-        if (!parse_number_token(d, pos, x) || !parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
+  for (const PathSegment& segment : parsed->segments) {
+    switch (segment.kind) {
+      case PathSegmentKind::Move:
         flush_active();
-        current = {x, y};
-        subpath_start = current;
-        cmd = relative ? 'l' : 'L';
-        upper = 'L';
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'M';
-      } else if (upper == 'L') {
-        double x = 0.0, y = 0.0;
-        if (!parse_number_token(d, pos, x) || !parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        const Point next{x, y};
-        active.segments.push_back({CurveKind::Line, current, next, {}, {}});
-        current = next;
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'L';
-      } else if (upper == 'H') {
-        double x = 0.0;
-        if (!parse_number_token(d, pos, x)) return std::nullopt;
-        if (relative) x += current.x;
-        const Point next{x, current.y};
-        active.segments.push_back({CurveKind::Line, current, next, {}, {}});
-        current = next;
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'H';
-      } else if (upper == 'V') {
-        double y = 0.0;
-        if (!parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) y += current.y;
-        const Point next{current.x, y};
-        active.segments.push_back({CurveKind::Line, current, next, {}, {}});
-        current = next;
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'V';
-      } else if (upper == 'Q') {
-        double x1=0,y1=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x1) || !parse_number_token(d,pos,y1) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x1 += current.x; y1 += current.y; x += current.x; y += current.y; }
-        const Point control{x1, y1};
-        const Point next{x, y};
-        active.segments.push_back({CurveKind::Quadratic, current, control, next, {}});
-        current = next;
-        last_quad_ctrl = control;
-        has_last_quad = true;
-        has_last_cubic = false;
-        prev_cmd = 'Q';
-      } else if (upper == 'T') {
-        double x=0,y=0;
-        if (!parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        Point control = current;
-        if (has_last_quad && (prev_cmd == 'Q' || prev_cmd == 'T')) {
-          control = {2 * current.x - last_quad_ctrl.x, 2 * current.y - last_quad_ctrl.y};
+        break;
+      case PathSegmentKind::Line:
+        active.segments.push_back(
+            {CurveKind::Line, segment.start, segment.end, {}, {}});
+        break;
+      case PathSegmentKind::Quadratic:
+        active.segments.push_back(
+            {CurveKind::Quadratic, segment.start, segment.control1, segment.end, {}});
+        break;
+      case PathSegmentKind::Cubic:
+        active.segments.push_back(
+            {CurveKind::Cubic, segment.start, segment.control1,
+             segment.control2, segment.end});
+        break;
+      case PathSegmentKind::Arc:
+        for (const CurveSegment& arc_segment : arc_to_curve_segments(
+                 segment.start, segment.radius_x, segment.radius_y,
+                 segment.x_axis_rotation, segment.large_arc ? 1 : 0,
+                 segment.sweep ? 1 : 0, segment.end)) {
+          active.segments.push_back(arc_segment);
         }
-        if (relative) { x += current.x; y += current.y; }
-        const Point next{x, y};
-        active.segments.push_back({CurveKind::Quadratic, current, control, next, {}});
-        current = next;
-        last_quad_ctrl = control;
-        has_last_quad = true;
-        has_last_cubic = false;
-        prev_cmd = 'T';
-      } else if (upper == 'C') {
-        double x1=0,y1=0,x2=0,y2=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x1) || !parse_number_token(d,pos,y1) ||
-            !parse_number_token(d,pos,x2) || !parse_number_token(d,pos,y2) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x1 += current.x; y1 += current.y; x2 += current.x; y2 += current.y; x += current.x; y += current.y; }
-        const Point c1{x1, y1};
-        const Point c2{x2, y2};
-        const Point next{x, y};
-        active.segments.push_back({CurveKind::Cubic, current, c1, c2, next});
-        current = next;
-        last_cubic_ctrl = c2;
-        has_last_cubic = true;
-        has_last_quad = false;
-        prev_cmd = 'C';
-      } else if (upper == 'S') {
-        double x2=0,y2=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x2) || !parse_number_token(d,pos,y2) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        Point c1 = current;
-        if (has_last_cubic && (prev_cmd == 'C' || prev_cmd == 'S')) {
-          c1 = {2 * current.x - last_cubic_ctrl.x, 2 * current.y - last_cubic_ctrl.y};
+        break;
+      case PathSegmentKind::Close:
+        if (active.segments.empty()) {
+          active.segments.push_back(
+              {CurveKind::Line, segment.start, segment.end, {}, {}});
+        } else {
+          const Point first = active.segments.front().p0;
+          const Point last = curve_segment_end(active.segments.back());
+          if (first.x != last.x || first.y != last.y) {
+            active.segments.push_back(
+                {CurveKind::Line, last, first, {}, {}});
+          }
         }
-        if (relative) { x2 += current.x; y2 += current.y; x += current.x; y += current.y; }
-        const Point c2{x2, y2};
-        const Point next{x, y};
-        active.segments.push_back({CurveKind::Cubic, current, c1, c2, next});
-        current = next;
-        last_cubic_ctrl = c2;
-        has_last_cubic = true;
-        has_last_quad = false;
-        prev_cmd = 'S';
-      } else if (upper == 'A') {
-        double rx = 0.0, ry = 0.0, rot = 0.0, x = 0.0, y = 0.0;
-        int large = 0, sweep = 0;
-        if (!parse_number_token(d, pos, rx) || !parse_number_token(d, pos, ry) ||
-            !parse_number_token(d, pos, rot) || !parse_arc_flag(d, pos, large) ||
-            !parse_arc_flag(d, pos, sweep) || !parse_number_token(d, pos, x) ||
-            !parse_number_token(d, pos, y)) return std::nullopt;
-        if (!valid_svg_arc_parameters(rx, ry, large, sweep)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        const Point next{x, y};
-        for (const CurveSegment& segment : arc_to_curve_segments(
-               current, rx, ry, rot, large, sweep, next)) {
-          active.segments.push_back(segment);
-        }
-        current = next;
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'A';
-      } else {
-        return std::nullopt;
-      }
-
-      skip_separators(d, pos);
-      if (pos < d.size() && is_command_char(d[pos])) break;
+        active.closed = true;
+        flush_active();
+        break;
     }
-    if (pos == iteration_start) return std::nullopt;
   }
-
   flush_active();
   return subpaths;
 }
@@ -1105,6 +1125,36 @@ std::string build_closed_curve_outline(const CurveSubpath& subpath,
 
 }  // namespace
 
+bool stroke_path_can_paint(const std::string& d, const std::string& linecap) {
+  const auto parsed = parse_path_data(d);
+  if (!parsed) return false;
+  const bool cap_paints_zero_length = linecap == "round" || linecap == "square";
+
+  for (const PathSegment& segment : parsed->segments) {
+    bool has_extent = false;
+    switch (segment.kind) {
+      case PathSegmentKind::Move:
+        continue;
+      case PathSegmentKind::Line:
+      case PathSegmentKind::Arc:
+      case PathSegmentKind::Close:
+        has_extent = !points_equal(segment.start, segment.end);
+        break;
+      case PathSegmentKind::Quadratic:
+        has_extent = !points_equal(segment.start, segment.control1) ||
+                     !points_equal(segment.start, segment.end);
+        break;
+      case PathSegmentKind::Cubic:
+        has_extent = !points_equal(segment.start, segment.control1) ||
+                     !points_equal(segment.start, segment.control2) ||
+                     !points_equal(segment.start, segment.end);
+        break;
+    }
+    if (has_extent || cap_paints_zero_length) return true;
+  }
+  return false;
+}
+
 std::string build_straight_stroke_outline(const std::string& d,
                                           double stroke_width,
                                           const std::string& linecap,
@@ -1119,11 +1169,29 @@ std::string build_straight_stroke_outline(const std::string& d,
   const double half_width = stroke_width / 2.0;
   std::string combined;
   for (const StrokeSubpath& subpath : *subpaths) {
-    if (subpath.points.size() < 2) continue;
-    std::string part = subpath.closed
-      ? build_closed_stroke_outline(subpath.points, half_width, linejoin, miter_limit)
-      : build_open_stroke_outline(subpath.points, half_width, linejoin, linecap, miter_limit);
-    if (part.empty()) {
+    const bool zero_length = is_zero_length_subpath(subpath);
+    if (subpath.points.size() < 2 && !zero_length) continue;
+    const auto retrace = zero_length
+        ? std::optional<std::string>{}
+        : build_two_segment_retrace_outline(
+              subpath, half_width, linecap, linejoin);
+    if (!retrace && has_immediate_direction_reversal(subpath)) {
+      // More complex retraces need a path-union operation to produce one
+      // non-self-crossing fill. Let the caller retain the live stroke instead
+      // of emitting an outline with silently cancelled regions.
+      return "";
+    }
+    std::string part = zero_length
+        ? build_zero_length_cap(subpath.points.front(), half_width, linecap)
+        : (retrace
+            ? *retrace
+            : (subpath.closed
+                ? build_closed_stroke_outline(
+                      subpath.points, half_width, linejoin, miter_limit)
+                : build_open_stroke_outline(
+                      subpath.points, half_width, linejoin, linecap,
+                      miter_limit)));
+    if (part.empty() && !zero_length) {
       part = build_fallback_polyline_outline(subpath.points, half_width, subpath.closed);
     }
     if (!part.empty()) {
@@ -1148,10 +1216,14 @@ std::string build_curve_fallback_outline(const std::string& d,
         combined.clear();
         break;
       }
-      const std::string part = subpath.closed
-        ? build_closed_curve_outline(subpath, half_width, linejoin, miter_limit)
-        : build_open_curve_outline(subpath, half_width, linecap, linejoin, miter_limit);
-      if (part.empty()) {
+      const bool zero_length = is_zero_length_subpath(subpath);
+      const std::string part = zero_length
+        ? build_zero_length_cap(subpath.segments.front().p0, half_width, linecap)
+        : (subpath.closed
+            ? build_closed_curve_outline(subpath, half_width, linejoin, miter_limit)
+            : build_open_curve_outline(
+                subpath, half_width, linecap, linejoin, miter_limit));
+      if (part.empty() && !zero_length) {
         combined.clear();
         break;
       }

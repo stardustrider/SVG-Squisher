@@ -6,11 +6,14 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <pugixml.hpp>
 
+#include "svg_computed_style.h"
 #include "svg_dom.h"
 #include "svg_path.h"
+#include "svg_shape.h"
 #include "svg_style.h"
 #include "svg_transform.h"
 #include "svg_util.h"
@@ -31,7 +34,7 @@ void add_warning(std::vector<Diagnostic>& diagnostics,
                  const std::string& message,
                  const pugi::xml_node& node) {
   const std::string element = element_label(node);
-  const std::string key = code + "\n" + element;
+  const std::string key = code + "\n" + element + "\n" + message;
   if (!seen.insert(key).second) return;
   diagnostics.push_back({DiagnosticSeverity::Warning, code, message, element});
 }
@@ -105,29 +108,33 @@ bool css_numeric_value_is_valid(const std::string& property,
   return true;
 }
 
-std::string css_url_target(const std::string& value,
-                           std::size_t open,
-                           std::size_t close) {
-  std::string target = trim(value.substr(open + 4, close - open - 4));
-  if (target.size() >= 2 &&
-      ((target.front() == '\'' && target.back() == '\'') ||
-       (target.front() == '"' && target.back() == '"'))) {
-    target = trim(target.substr(1, target.size() - 2));
+bool css_property_uses_length(const std::string& property) {
+  return property == "stroke-width" || property == "font-size" ||
+         property == "letter-spacing";
+}
+
+std::string compatible_css_numeric_action(const std::string& property) {
+  if (property == "opacity" || property == "fill-opacity" ||
+      property == "stroke-opacity") {
+    return "Compatible conversion substitutes the default value 1.";
   }
-  return target;
+  if (property == "stroke-width") {
+    return "Compatible conversion substitutes the default stroke width of 1.";
+  }
+  if (property == "stroke-miterlimit") {
+    return "Compatible conversion substitutes the default miter limit of 4.";
+  }
+  if (property == "font-size") {
+    return "Compatible conversion substitutes the default font size of 16.";
+  }
+  if (property == "letter-spacing") {
+    return "Compatible conversion substitutes the default letter spacing of 0.";
+  }
+  return "Compatible conversion ignores this declaration.";
 }
 
 bool has_external_css_url(const std::string& value) {
-  const std::string lowered = lower_copy(value);
-  std::size_t cursor = 0;
-  while ((cursor = lowered.find("url(", cursor)) != std::string::npos) {
-    const std::size_t close = lowered.find(')', cursor + 4);
-    if (close == std::string::npos) return false;
-    const std::string target = css_url_target(value, cursor, close);
-    if (!target.empty() && target.front() != '#') return true;
-    cursor = close + 1;
-  }
-  return false;
+  return analyze_css_urls(value).has_unsafe_url;
 }
 
 void inspect_css_declarations(const std::string& declarations,
@@ -136,7 +143,8 @@ void inspect_css_declarations(const std::string& declarations,
                               std::set<std::string>& seen) {
   if (has_external_css_url(declarations)) {
     add_warning(diagnostics, seen, "unsupported-external-reference",
-                "External references are not fetched during conversion.", node);
+                "External CSS url(...) resources are not fetched; compatible conversion replaces external fill/stroke paints with none and ignores other external resource declarations.",
+                node);
   }
   for (const std::string& declaration : split(declarations, ';')) {
     const std::size_t colon = declaration.find(':');
@@ -145,15 +153,83 @@ void inspect_css_declarations(const std::string& declarations,
     const std::string value = trim(declaration.substr(colon + 1));
     if (!property.empty() && !css_property_is_supported(property)) {
       add_warning(diagnostics, seen, "unsupported-css-property",
-                  "The CSS property '" + property + "' is not represented in path output.", node);
+                  "Compatible conversion ignores the unsupported CSS property '" +
+                    property + "'.",
+                  node);
       break;
+    }
+    if (!property.empty() && css_property_uses_length(property) &&
+        has_non_px_unit(without_important(value))) {
+      add_warning(diagnostics,
+                  seen,
+                  "unsupported-length-unit",
+                  "The CSS property '" + property +
+                    "' uses an unsupported relative or physical unit. " +
+                    compatible_css_numeric_action(property),
+                  node);
+      continue;
     }
     if (!property.empty() && !css_numeric_value_is_valid(property, value)) {
       add_warning(diagnostics, seen, "invalid-numeric-value",
                   "The CSS property '" + property +
-                    "' has an invalid, non-finite, or out-of-range numeric value.", node);
+                    "' has an invalid, non-finite, or out-of-range numeric value. " +
+                    compatible_css_numeric_action(property),
+                  node);
     }
   }
+}
+
+std::string compatible_length_action(const pugi::xml_node& node,
+                                     const std::string& attribute) {
+  const std::string name = node.name();
+  if ((name == "text" || name == "tspan") &&
+      (attribute == "x" || attribute == "y")) {
+    return "Compatible conversion ignores this position list and keeps the current text cursor " +
+      attribute + " coordinate.";
+  }
+  if ((name == "text" || name == "tspan") &&
+      (attribute == "dx" || attribute == "dy")) {
+    return "Compatible conversion ignores this position list, so this attribute applies no text displacement.";
+  }
+  if (attribute == "textLength") {
+    return "Compatible conversion ignores textLength while outlining text.";
+  }
+  if (attribute == "stroke-width") {
+    return "Compatible conversion substitutes the default stroke width of 1.";
+  }
+  if (attribute == "font-size") {
+    return "Compatible conversion substitutes the default font size of 16.";
+  }
+  if (attribute == "letter-spacing") {
+    return "Compatible conversion substitutes the default letter spacing of 0.";
+  }
+  if (attribute == "x" || attribute == "y" || attribute == "x1" ||
+      attribute == "y1" || attribute == "x2" || attribute == "y2" ||
+      attribute == "cx" || attribute == "cy") {
+    return "Compatible conversion substitutes 0 for this coordinate.";
+  }
+  if ((attribute == "width" || attribute == "height") && name == "rect") {
+    return "Compatible conversion substitutes 0, so this rect geometry is dropped.";
+  }
+  if (attribute == "r" && name == "circle") {
+    return "Compatible conversion substitutes 0, so this circle geometry is dropped.";
+  }
+  if ((attribute == "rx" || attribute == "ry") && name == "ellipse") {
+    return "Compatible conversion substitutes 0, so this ellipse geometry is dropped.";
+  }
+  if ((attribute == "rx" || attribute == "ry") && name == "rect") {
+    return "Compatible conversion treats this radius as 0 before applying the rectangle's paired-radius rules.";
+  }
+  if ((attribute == "width" || attribute == "height") && name == "use") {
+    return "Compatible conversion ignores this value; a referenced symbol instance resolves the automatic dimension from the symbol, then the supported root viewport.";
+  }
+  if ((attribute == "width" || attribute == "height") && name == "symbol") {
+    return "Compatible conversion ignores this value; the automatic symbol dimension resolves from the supported root viewport.";
+  }
+  if ((attribute == "width" || attribute == "height") && name == "svg") {
+    return "Compatible output preserves this root attribute verbatim, but conversion does not use it as a finite viewport length.";
+  }
+  return "Compatible conversion substitutes 0 for this length.";
 }
 
 void inspect_numeric_attributes(const pugi::xml_node& node,
@@ -169,12 +245,15 @@ void inspect_numeric_attributes(const pugi::xml_node& node,
       return;
     }
     if (property == "letter-spacing" && lower_copy(trim(raw_value)) == "normal") return;
+    if (has_non_px_unit(raw_value)) return;
     double value = 0.0;
     if (!parse_finite_length(raw_value, value) ||
         (non_negative && value < 0.0)) {
       add_warning(diagnostics, seen, "invalid-numeric-value",
                   std::string(attribute) +
-                    " has an invalid, non-finite, or out-of-range numeric value.", node);
+                    " has an invalid, non-finite, or out-of-range numeric value. " +
+                    compatible_length_action(node, attribute),
+                  node);
     }
   };
   const auto check_number = [&](const char* attribute, double minimum) {
@@ -185,7 +264,11 @@ void inspect_numeric_attributes(const pugi::xml_node& node,
     if (!parse_finite_number(raw_value, value) || value < minimum) {
       add_warning(diagnostics, seen, "invalid-numeric-value",
                   std::string(attribute) +
-                    " has an invalid, non-finite, or out-of-range numeric value.", node);
+                    " has an invalid, non-finite, or out-of-range numeric value. " +
+                    (std::string(attribute) == "stroke-miterlimit"
+                         ? "Compatible conversion substitutes the default miter limit of 4."
+                         : "Compatible conversion substitutes its default value."),
+                  node);
     }
   };
 
@@ -193,9 +276,13 @@ void inspect_numeric_attributes(const pugi::xml_node& node,
   for (const char* attribute : {"x", "y"}) {
     if (!node.attribute(attribute)) continue;
     if (text_position) {
-      if (parse_length_list(node.attribute(attribute).as_string()).empty()) {
+      if (!has_non_px_unit(node.attribute(attribute).as_string()) &&
+          parse_length_list(node.attribute(attribute).as_string()).empty()) {
         add_warning(diagnostics, seen, "invalid-numeric-value",
-                    std::string(attribute) + " does not contain a valid finite length list.", node);
+                    std::string(attribute) +
+                      " does not contain a valid finite length list. " +
+                      compatible_length_action(node, attribute),
+                    node);
       }
     } else {
       check_length(attribute, false);
@@ -204,9 +291,13 @@ void inspect_numeric_attributes(const pugi::xml_node& node,
   if (text_position) {
     for (const char* attribute : {"dx", "dy"}) {
       if (node.attribute(attribute) &&
+          !has_non_px_unit(node.attribute(attribute).as_string()) &&
           parse_length_list(node.attribute(attribute).as_string()).empty()) {
         add_warning(diagnostics, seen, "invalid-numeric-value",
-                    std::string(attribute) + " does not contain a valid finite length list.", node);
+                    std::string(attribute) +
+                      " does not contain a valid finite length list. " +
+                      compatible_length_action(node, attribute),
+                    node);
       }
     }
   }
@@ -225,7 +316,9 @@ void inspect_numeric_attributes(const pugi::xml_node& node,
     double value = 0.0;
     if (!parse_finite_number(node.attribute(attribute).as_string(), value)) {
       add_warning(diagnostics, seen, "invalid-numeric-value",
-                  std::string(attribute) + " does not contain a finite number.", node);
+                  std::string(attribute) +
+                    " does not contain a finite number. Compatible conversion substitutes the default value 1.",
+                  node);
     }
   }
   check_number("stroke-miterlimit", 1.0);
@@ -233,20 +326,28 @@ void inspect_numeric_attributes(const pugi::xml_node& node,
   if (node.attribute("transform") &&
       !transform_is_valid(node.attribute("transform").as_string())) {
     add_warning(diagnostics, seen, "invalid-numeric-value",
-                "transform is malformed or contains a non-finite value.", node);
+                "transform is malformed or contains a non-finite value. Compatible conversion ignores the entire local transform.",
+                node);
   }
   if (node.attribute("viewBox")) {
-    const std::vector<double> values = parse_number_list(node.attribute("viewBox").as_string());
-    if (values.size() != 4 || values[2] <= 0.0 || values[3] <= 0.0) {
+    const auto values = parse_viewbox(node.attribute("viewBox").as_string());
+    if (!values || (*values)[2] < 0.0 || (*values)[3] < 0.0) {
+      const bool is_root_svg = name == "svg" &&
+        node.parent().type() == pugi::node_document;
       add_warning(diagnostics, seen, "invalid-numeric-value",
-                  "viewBox must contain four finite numbers with positive width and height.", node);
+                  "viewBox must contain four finite SVG numbers with non-negative width and height; a zero dimension disables rendering. " +
+                    std::string(is_root_svg
+                      ? "Compatible output preserves the invalid root viewBox verbatim and leaves viewport handling to the renderer."
+                      : "Compatible conversion ignores this viewBox and processes supported descendants in the current user coordinate system."),
+                  node);
     }
   }
   if ((name == "polyline" || name == "polygon") && node.attribute("points")) {
-    const std::vector<double> values = parse_number_list(node.attribute("points").as_string());
-    if (values.size() < 2 || values.size() % 2 != 0) {
+    const auto values = parse_points_list(node.attribute("points").as_string());
+    if (!values) {
       add_warning(diagnostics, seen, "invalid-numeric-value",
-                  "points must contain a finite sequence of coordinate pairs.", node);
+                  "points must contain a finite sequence of coordinate pairs. Compatible conversion drops this polyline or polygon geometry.",
+                  node);
     }
   }
 }
@@ -271,33 +372,16 @@ enum class ExpansionProblem {
   ReferenceDepth,
   CombinedDepth,
   NodeBudget,
-  OutputBudget,
 };
 
 struct ExpansionInspection {
   ExpansionProblem problem = ExpansionProblem::None;
   pugi::xml_node problem_node;
   std::size_t expanded_nodes = 1;
-  std::size_t estimated_output_paths = 0;
 };
 
-std::size_t maximum_output_paths_for_node(const pugi::xml_node& node) {
-  const std::string name = node.name();
-  if (name == "path" || name == "rect" || name == "circle" || name == "ellipse" ||
-      name == "line" || name == "polyline" || name == "polygon") {
-    return 2;
-  }
-  if (name != "text" && name != "tspan" && name != "textPath") return 0;
-
-  std::size_t text_chunks = 0;
-  for (const pugi::xml_node child : node.children()) {
-    if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) ++text_chunks;
-  }
-  return text_chunks * 2;
-}
-
 void inspect_expanded_tree(const pugi::xml_node& node,
-                           const pugi::xml_node& root,
+                           const SvgIdIndex& id_index,
                            std::set<std::string>& active,
                            std::size_t reference_depth,
                            std::size_t combined_depth,
@@ -319,14 +403,6 @@ void inspect_expanded_tree(const pugi::xml_node& node,
   }
   ++inspection.expanded_nodes;
 
-  const std::size_t added_paths = maximum_output_paths_for_node(node);
-  if (added_paths > kMaxOutputPathCount - inspection.estimated_output_paths) {
-    inspection.problem = ExpansionProblem::OutputBudget;
-    inspection.problem_node = node;
-    return;
-  }
-  inspection.estimated_output_paths += added_paths;
-
   const std::string name = node.name();
   if (should_skip_tag(name) && !(referenced_root && name == "symbol")) return;
 
@@ -345,10 +421,10 @@ void inspect_expanded_tree(const pugi::xml_node& node,
         inspection.problem_node = node;
         return;
       }
-      if (const auto target = find_by_id(root, id)) {
+      if (const auto target = find_by_id(id_index, id)) {
         active.insert(id);
         inspect_expanded_tree(*target,
-                              root,
+                              id_index,
                               active,
                               reference_depth + 1,
                               combined_depth + 1,
@@ -362,7 +438,7 @@ void inspect_expanded_tree(const pugi::xml_node& node,
 
   for (const pugi::xml_node child : node.children()) {
     inspect_expanded_tree(child,
-                          root,
+                          id_index,
                           active,
                           reference_depth,
                           combined_depth + 1,
@@ -372,14 +448,16 @@ void inspect_expanded_tree(const pugi::xml_node& node,
   }
 }
 
-bool expansion_may_paint_multiple_elements(const pugi::xml_node& node,
-                                           const pugi::xml_node& root,
-                                           std::set<std::string>& active,
-                                           std::size_t reference_depth,
-                                           std::size_t combined_depth,
-                                           bool referenced_root,
-                                           std::size_t& visited_nodes,
-                                           std::size_t& painted_elements) {
+bool expansion_may_paint_multiple_layers(const pugi::xml_node& node,
+                                         const SvgIdIndex& id_index,
+                                         const std::vector<CssRule>& rules,
+                                         const StyleState& inherited,
+                                         std::set<std::string>& active,
+                                         std::size_t reference_depth,
+                                         std::size_t combined_depth,
+                                         bool referenced_root,
+                                         std::size_t& visited_nodes,
+                                         std::size_t& painted_layers) {
   if (node.type() != pugi::node_element) return false;
   if (combined_depth > kMaxExpandedTraversalDepth ||
       reference_depth > kMaxUseReferenceDepth ||
@@ -390,17 +468,47 @@ bool expansion_may_paint_multiple_elements(const pugi::xml_node& node,
 
   const std::string name = node.name();
   if (should_skip_tag(name) && !(referenced_root && name == "symbol")) return false;
+  StyleState style = resolve_style(node, rules, inherited);
+  if (referenced_root && name == "symbol") style.display = "inline";
+  const ComputedStyle computed = compute_style(style);
+  if (!computed.displayed) return false;
+
   if (name == "path" || name == "rect" || name == "circle" || name == "ellipse" ||
       name == "line" || name == "polyline" || name == "polygon") {
-    if (++painted_elements >= 2) return true;
+    const std::string path_data = node_to_path(node);
+    const bool valid_geometry = !path_data.empty() &&
+      (name != "path" || path_data_is_valid(path_data));
+    const bool may_paint = computed.visible && valid_geometry &&
+      (name == "line" ? computed.has_stroke : computed.has_fill || computed.has_stroke);
+    if (may_paint && ++painted_layers >= 2) return true;
   }
+
   if (name == "text" || name == "tspan" || name == "textPath") {
+    const bool text_may_paint = computed.visible && computed.font_size > 0.0 &&
+      (computed.has_fill || computed.has_stroke);
     for (const pugi::xml_node child : node.children()) {
-      if ((child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) &&
-          !trim(child.value()).empty() && ++painted_elements >= 2) {
+      if (text_may_paint &&
+          (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) &&
+          !trim(child.value()).empty() && ++painted_layers >= 2) {
+        return true;
+      }
+      if (child.type() != pugi::node_element) continue;
+      const std::string child_name = child.name();
+      if (child_name != "tspan" && child_name != "textPath") continue;
+      if (expansion_may_paint_multiple_layers(child,
+                                              id_index,
+                                              rules,
+                                              style,
+                                              active,
+                                              reference_depth,
+                                              combined_depth + 1,
+                                              false,
+                                              visited_nodes,
+                                              painted_layers)) {
         return true;
       }
     }
+    return false;
   }
 
   if (name == "use") {
@@ -411,25 +519,35 @@ bool expansion_may_paint_multiple_elements(const pugi::xml_node& node,
     if (active.find(id) != active.end() || reference_depth >= kMaxUseReferenceDepth) {
       return true;
     }
-    const auto target = find_by_id(root, id);
+    const auto target = find_by_id(id_index, id);
     if (!target) return false;
     active.insert(id);
-    const bool multiple = expansion_may_paint_multiple_elements(
-        *target, root, active, reference_depth + 1, combined_depth + 1, true,
-        visited_nodes, painted_elements);
+    const bool multiple = expansion_may_paint_multiple_layers(
+        *target,
+        id_index,
+        rules,
+        style,
+        active,
+        reference_depth + 1,
+        combined_depth + 1,
+        true,
+        visited_nodes,
+        painted_layers);
     active.erase(id);
     return multiple;
   }
 
   for (const pugi::xml_node child : node.children()) {
-    if (expansion_may_paint_multiple_elements(child,
-                                              root,
-                                              active,
-                                              reference_depth,
-                                              combined_depth + 1,
-                                              false,
-                                              visited_nodes,
-                                              painted_elements)) {
+    if (expansion_may_paint_multiple_layers(child,
+                                            id_index,
+                                            rules,
+                                            style,
+                                            active,
+                                            reference_depth,
+                                            combined_depth + 1,
+                                            false,
+                                            visited_nodes,
+                                            painted_layers)) {
       return true;
     }
   }
@@ -449,8 +567,12 @@ void inspect_css(const pugi::xml_node& node,
     const std::string selector_list = css.substr(cursor, open - cursor);
     for (const std::string& selector : split(selector_list, ',')) {
       if (!selector_is_simple(selector)) {
+        const std::string unsupported_selector = trim(selector);
         add_warning(diagnostics, seen, "unsupported-css-selector",
-                    "Combinators, attribute selectors, and pseudo-classes are not resolved; this rule may be ignored.", node);
+                    "The CSS rule for selector \"" + unsupported_selector +
+                        "\" is ignored during compatible conversion because combinators, "
+                        "attribute selectors, and pseudo-classes are unsupported.",
+                    node);
         break;
       }
     }
@@ -460,16 +582,62 @@ void inspect_css(const pugi::xml_node& node,
   }
 }
 
+bool has_complex_text_anchor_positioning(const pugi::xml_node& node) {
+  const auto coordinate_count = [](const pugi::xml_node& element,
+                                   const char* attribute_name) {
+    const pugi::xml_attribute attribute = element.attribute(attribute_name);
+    return attribute ? parse_length_list(attribute.as_string()).size()
+                     : std::size_t{0};
+  };
+
+  if (std::max(coordinate_count(node, "x"),
+               coordinate_count(node, "y")) > 1) {
+    return true;
+  }
+
+  std::vector<pugi::xml_node> pending;
+  for (const pugi::xml_node child : node.children()) {
+    if (child.type() == pugi::node_element) pending.push_back(child);
+  }
+  while (!pending.empty()) {
+    const pugi::xml_node descendant = pending.back();
+    pending.pop_back();
+    const std::string name = descendant.name();
+    if (name != "tspan" && name != "textPath") continue;
+    if (descendant.attribute("x") || descendant.attribute("y")) {
+      return true;
+    }
+    for (const pugi::xml_node child : descendant.children()) {
+      if (child.type() == pugi::node_element) pending.push_back(child);
+    }
+  }
+  return false;
+}
+
 void inspect_node(const pugi::xml_node& node,
                   const pugi::xml_node& root,
+                  const SvgIdIndex& id_index,
                   const std::vector<CssRule>& rules,
                   std::vector<Diagnostic>& diagnostics,
                   std::set<std::string>& seen,
-                  std::size_t source_depth) {
+                  std::size_t source_depth,
+                  const StyleState& inherited) {
   if (node.type() != pugi::node_element) return;
   const std::string name = node.name();
+  const StyleState resolved_style = resolve_style(node, rules, inherited);
 
   inspect_numeric_attributes(node, diagnostics, seen);
+
+  if ((name == "text" || name == "tspan") &&
+      compute_style(resolved_style).text_anchor != TextAnchorMode::Start &&
+      has_complex_text_anchor_positioning(node)) {
+    add_warning(
+      diagnostics,
+      seen,
+      "unsupported-text-anchor-chunk-positioning",
+      "Middle/end text anchoring with a multi-value x/y list or descendant absolute x/y creates multiple text chunks whose cross-element membership is not fully represented. Compatible conversion preserves logical x/y/dx/dy list consumption and applies node-local anchor shifts, so text following a positioned descendant may be offset differently; strict conversion rejects this text.",
+      node);
+  }
 
   if (!element_is_known(name)) {
     add_warning(diagnostics, seen, "unsupported-element",
@@ -481,9 +649,17 @@ void inspect_node(const pugi::xml_node& node,
     inspect_css_declarations(node.attribute("style").as_string(), node, diagnostics, seen);
   }
   for (const pugi::xml_attribute attribute : node.attributes()) {
+    const std::string attribute_name = attribute.name();
+    if (attribute_name == "style" || attribute_name == "href" ||
+        attribute_name == "xlink:href") {
+      continue;
+    }
     if (has_external_css_url(attribute.as_string())) {
       add_warning(diagnostics, seen, "unsupported-external-reference",
-                  "External references are not fetched during conversion.", node);
+                  (attribute_name == "fill" || attribute_name == "stroke")
+                      ? "External paint URLs are not fetched; compatible conversion replaces this paint with none."
+                      : "External URL resources are not fetched; compatible conversion ignores this resource-valued attribute.",
+                  node);
       break;
     }
   }
@@ -502,10 +678,14 @@ void inspect_node(const pugi::xml_node& node,
                 "Embedded or external raster/HTML content is not converted to paths.", node);
   } else if (name == "textPath") {
     add_warning(diagnostics, seen, "unsupported-text-path",
-                "Text-on-path positioning is not implemented; glyph placement may change.", node);
+                "Text-on-path positioning is not implemented; compatible conversion uses "
+                "normal-cursor text layout instead.",
+                node);
   } else if (name == "switch") {
     add_warning(diagnostics, seen, "unsupported-switch",
-                "Conditional switch selection is not evaluated.", node);
+                "Conditional switch selection is not evaluated; compatible conversion "
+                "traverses all branches in document order.",
+                node);
   } else if (name == "marker") {
     add_warning(diagnostics, seen, "unsupported-marker",
                 "Markers are not expanded into output geometry.", node);
@@ -515,7 +695,11 @@ void inspect_node(const pugi::xml_node& node,
                 "Animated SVG state is not represented in static path output.", node);
   } else if (name == "svg" && node != root) {
     add_warning(diagnostics, seen, "unsupported-nested-viewport",
-                "Nested SVG viewport and preserveAspectRatio semantics are not fully resolved.", node);
+                "Nested SVG viewport and preserveAspectRatio semantics are not resolved; "
+                "compatible conversion ignores x, y, width, height, viewBox, and "
+                "preserveAspectRatio on this nested viewport, then traverses its children "
+                "in the current user coordinate system with any transform still applied.",
+                node);
   }
 
   for (const char* attr : {"clip-path", "mask", "filter"}) {
@@ -533,42 +717,42 @@ void inspect_node(const pugi::xml_node& node,
     }
   }
 
-  const StyleState resolved_style = resolve_style(node, rules, StyleState{});
-  if ((name == "g" || name == "svg" || name == "symbol") &&
-      node_has_local_property(node, rules, "opacity") &&
-      parse_double_string(resolved_style.opacity, 1.0) < 1.0) {
-    add_warning(diagnostics, seen, "group-opacity-flattened",
-                "Compatible conversion multiplies group opacity into descendants; overlapping children may composite differently.", node);
-  }
-
   std::string href = node.attribute("href").as_string();
   if (href.empty()) href = node.attribute("xlink:href").as_string();
   if (!href.empty() && href.front() != '#') {
     add_warning(diagnostics, seen, "unsupported-external-reference",
-                "External references are not fetched during conversion.", node);
-  } else if (name == "use" && href.size() > 1 &&
-             node_has_local_property(node, rules, "opacity") &&
-             parse_double_string(resolve_style(node, rules, StyleState{}).opacity, 1.0) < 1.0) {
-    const auto target = find_by_id(root, href.substr(1));
-    if (target) {
-      std::set<std::string> active{href.substr(1)};
-      std::size_t visited_nodes = 0;
-      std::size_t painted_elements = 0;
-      if (expansion_may_paint_multiple_elements(*target,
-                                                root,
-                                                active,
-                                                1,
-                                                source_depth + 1,
-                                                true,
-                                                visited_nodes,
-                                                painted_elements)) {
-        add_warning(
-            diagnostics,
-            seen,
-            "use-opacity-flattened",
-            "Opacity on this use instance is distributed across multiple referenced elements; overlapping content may composite differently.",
-            node);
-      }
+                name == "use"
+                    ? "External use references are not fetched; compatible conversion emits no geometry for this use instance."
+                    : "External references are not fetched; compatible conversion removes the external resource link from retained output.",
+                node);
+  }
+
+  const double local_opacity = parse_double_string(resolved_style.opacity, 1.0);
+  if (node_has_local_property(node, rules, "opacity") &&
+      local_opacity > 0.0 && local_opacity < 1.0) {
+    std::set<std::string> active;
+    std::size_t visited_nodes = 0;
+    std::size_t painted_layers = 0;
+    const bool symbol_root = name == "symbol";
+    if (expansion_may_paint_multiple_layers(node,
+                                            id_index,
+                                            rules,
+                                            inherited,
+                                            active,
+                                            0,
+                                            source_depth,
+                                            symbol_root,
+                                            visited_nodes,
+                                            painted_layers)) {
+      const bool use_instance = name == "use";
+      add_warning(
+          diagnostics,
+          seen,
+          use_instance ? "use-opacity-flattened" : "group-opacity-flattened",
+          use_instance
+              ? "Opacity on this use instance is distributed across multiple referenced layers; overlapping content may composite differently."
+              : "Opacity on this element is distributed across multiple painted layers; overlapping content may composite differently.",
+          node);
     }
   }
 
@@ -579,7 +763,8 @@ void inspect_node(const pugi::xml_node& node,
         lower_copy(resolved_style.fill) == "currentcolor" ||
         lower_copy(resolved_style.stroke) == "currentcolor") {
       add_warning(diagnostics, seen, "unsupported-current-color",
-                  "currentColor is not fully resolved into an explicit paint.", node);
+                  "Compatible output preserves the literal currentColor paint but does not preserve the source color cascade; the output renderer resolves it.",
+                  node);
       break;
     }
   }
@@ -590,21 +775,40 @@ void inspect_node(const pugi::xml_node& node,
                            "font-feature-settings"}) {
     if (node.attribute(attr) || inline_style.find(lower_copy(attr) + ":") != std::string::npos) {
       add_warning(diagnostics, seen, "unsupported-text-layout",
-                  std::string(attr) + " is not fully represented by text-to-path conversion.", node);
+                  "Compatible conversion ignores " + std::string(attr) +
+                    " while outlining text.",
+                  node);
       break;
     }
   }
 
-  for (const char* attr : {"x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry",
-                           "width", "height", "stroke-width", "font-size", "letter-spacing"}) {
-    if (node.attribute(attr) && has_non_px_unit(node.attribute(attr).as_string())) {
+  for (const char* attr : {"x", "y", "dx", "dy", "x1", "y1", "x2", "y2", "cx", "cy",
+                           "r", "rx", "ry", "width", "height", "stroke-width", "font-size",
+                           "letter-spacing", "textLength"}) {
+    const pugi::xml_attribute attribute = node.attribute(attr);
+    const bool automatic_symbol_dimension =
+      (name == "use" || name == "symbol") &&
+      (std::string(attr) == "width" || std::string(attr) == "height") &&
+      lower_copy(trim(attribute.as_string())) == "auto";
+    if (attribute && !automatic_symbol_dimension &&
+        has_non_px_unit(attribute.as_string())) {
       add_warning(diagnostics, seen, "unsupported-length-unit",
-                  std::string(attr) + " uses a relative or physical unit that is not fully resolved.", node);
+                  std::string(attr) +
+                    " uses an unsupported relative or physical unit. " +
+                    compatible_length_action(node, attr),
+                  node);
     }
   }
 
   for (pugi::xml_node child : node.children()) {
-    inspect_node(child, root, rules, diagnostics, seen, source_depth + 1);
+    inspect_node(child,
+                 root,
+                 id_index,
+                 rules,
+                 diagnostics,
+                 seen,
+                 source_depth + 1,
+                 resolved_style);
   }
 }
 
@@ -631,16 +835,17 @@ void validate_svg_structure_depth(const pugi::xml_node& svg_root) {
   }
 }
 
-std::vector<Diagnostic> inspect_svg_capabilities(const pugi::xml_node& svg_root) {
+std::vector<Diagnostic> inspect_svg_capabilities(const pugi::xml_node& svg_root,
+                                                 const SvgIdIndex& id_index) {
   std::vector<Diagnostic> diagnostics;
   std::set<std::string> seen;
   const std::vector<CssRule> rules = parse_css_rules(svg_root);
-  inspect_node(svg_root, svg_root, rules, diagnostics, seen, 1);
+  inspect_node(svg_root, svg_root, id_index, rules, diagnostics, seen, 1, StyleState{});
 
   ExpansionInspection expansion;
   std::set<std::string> active;
   for (const pugi::xml_node child : svg_root.children()) {
-    inspect_expanded_tree(child, svg_root, active, 0, 2, false, expansion);
+    inspect_expanded_tree(child, id_index, active, 0, 2, false, expansion);
     if (expansion.problem != ExpansionProblem::None) break;
   }
   switch (expansion.problem) {
@@ -664,11 +869,6 @@ std::vector<Diagnostic> inspect_svg_capabilities(const pugi::xml_node& svg_root)
     case ExpansionProblem::NodeBudget:
       add_warning(diagnostics, seen, "expanded-node-limit",
                   "Expanded use traversal exceeds the 16384-element visit limit; remaining referenced content was skipped.",
-                  expansion.problem_node);
-      break;
-    case ExpansionProblem::OutputBudget:
-      add_warning(diagnostics, seen, "output-path-limit",
-                  "Expanded content may exceed the 8192-output-path limit; remaining content was skipped.",
                   expansion.problem_node);
       break;
   }

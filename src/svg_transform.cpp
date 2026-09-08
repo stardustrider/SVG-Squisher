@@ -17,20 +17,25 @@ bool matrix_is_finite(const Matrix& matrix) {
          std::isfinite(matrix.e) && std::isfinite(matrix.f);
 }
 
+std::string trim_svg_whitespace(const std::string& value) {
+  std::size_t first = 0;
+  skip_svg_whitespace(value, first);
+  std::size_t last = value.size();
+  while (last > first && is_svg_whitespace(value[last - 1])) --last;
+  return value.substr(first, last - first);
+}
+
 std::optional<Matrix> parse_transform_checked(const std::string& transform_text) {
   Matrix current;
   std::size_t pos = 0;
+  skip_svg_whitespace(transform_text, pos);
   while (pos < transform_text.size()) {
-    while (pos < transform_text.size() &&
-           (std::isspace(static_cast<unsigned char>(transform_text[pos])) ||
-            transform_text[pos] == ',')) {
-      ++pos;
-    }
-    if (pos >= transform_text.size()) break;
+    if (transform_text[pos] == ',') return std::nullopt;
 
     const std::size_t open = transform_text.find('(', pos);
     if (open == std::string::npos) return std::nullopt;
-    const std::string name = trim(transform_text.substr(pos, open - pos));
+    const std::string name =
+        trim_svg_whitespace(transform_text.substr(pos, open - pos));
     const std::size_t close = transform_text.find(')', open + 1);
     if (close == std::string::npos) return std::nullopt;
     const std::vector<double> args =
@@ -69,6 +74,20 @@ std::optional<Matrix> parse_transform_checked(const std::string& transform_text)
     current = multiply(current, op);
     if (!matrix_is_finite(current)) return std::nullopt;
     pos = close + 1;
+
+    const std::size_t separator_start = pos;
+    skip_svg_whitespace(transform_text, pos);
+    const bool had_whitespace = pos != separator_start;
+    if (pos >= transform_text.size()) break;
+    if (transform_text[pos] == ',') {
+      ++pos;
+      skip_svg_whitespace(transform_text, pos);
+      if (pos >= transform_text.size() || transform_text[pos] == ',') {
+        return std::nullopt;
+      }
+    } else if (!had_whitespace) {
+      return std::nullopt;
+    }
   }
   return current;
 }
@@ -115,8 +134,8 @@ Matrix parse_transform(const std::string& transform_text) {
 }
 
 std::string combine_transform(const std::string& parent, const std::string& local) {
-  const std::string raw_parent = trim(parent);
-  const std::string raw_local = trim(local);
+  const std::string raw_parent = trim_svg_whitespace(parent);
+  const std::string raw_local = trim_svg_whitespace(local);
   const std::string a = transform_is_valid(raw_parent) ? raw_parent : "";
   const std::string b = transform_is_valid(raw_local) ? raw_local : "";
   if (a.empty()) return b;

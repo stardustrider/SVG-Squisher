@@ -4,6 +4,7 @@
   "generatorVersion": "0.2.0",
   "pathBase": "page",
   "options": {
+    "conversionPolicy": "preserve-appearance",
     "strict": false,
     "recursive": false,
     "continueOnError": true,

@@ -290,6 +290,50 @@
       font-size: 13px;
     }
 
+    .report-options {
+      margin: 0;
+      padding: 9px 12px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .report-options summary {
+      width: fit-content;
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .report-options-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px 18px;
+      margin: 10px 0 0;
+      padding-block-start: 10px;
+      border-block-start: 1px solid var(--line);
+    }
+
+    .report-option { min-width: 0; }
+
+    .report-option dt {
+      color: #7f909a;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+
+    .report-option dd {
+      margin: 2px 0 0;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+
     .results-list {
       display: grid;
       gap: 12px;
@@ -1729,6 +1773,42 @@
       directoryAlerts.replaceChildren(...alerts);
     }
 
+    function createReportOptions(options) {
+      if (!options || typeof options !== "object" || Array.isArray(options)) return null;
+      const knownOptions = [
+        ["conversionPolicy", "Conversion policy"],
+        ["strict", "Strict diagnostics"],
+        ["recursive", "Recursive"],
+        ["continueOnError", "Continue on error"],
+        ["removeBackground", "Remove background"],
+        ["overwrite", "Overwrite"],
+        ["allowInPlace", "Allow in place"],
+        ["precision", "Precision"],
+        ["fill", "Fill override"],
+        ["font", "Font"],
+      ];
+      const entries = knownOptions.filter(([key]) => Object.prototype.hasOwnProperty.call(options, key));
+      if (entries.length === 0) return null;
+
+      const details = document.createElement("details");
+      details.className = "report-options";
+      const summary = document.createElement("summary");
+      summary.textContent = `Conversion options (${entries.length})`;
+      const list = document.createElement("dl");
+      list.className = "report-options-list";
+      for (const [key, label] of entries) {
+        const item = document.createElement("div");
+        item.className = "report-option";
+        appendTextElement(item, "dt", label);
+        const value = options[key];
+        const rendered = value == null ? "Not set" : String(value);
+        appendTextElement(item, "dd", rendered);
+        list.appendChild(item);
+      }
+      details.append(summary, list);
+      return details;
+    }
+
     function showManifestNote(manifest) {
       const note = document.createElement("p");
       note.className = "report-note";
@@ -1751,7 +1831,8 @@
             .join(", ")
         : "";
       note.textContent = `Loaded SVG Squisher ${generatorVersion} report schema ${schemaVersion} from ${manifest.url.pathname}${totals ? ` — ${totals}` : ""}. File paths resolve from the report location.`;
-      directoryAlerts.replaceChildren(note);
+      const options = createReportOptions(manifest.report.options);
+      directoryAlerts.replaceChildren(...(options ? [note, options] : [note]));
     }
 
     function compareSource(row) {

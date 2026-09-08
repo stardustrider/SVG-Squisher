@@ -16,22 +16,13 @@ ParsedPaint parse_paint(const std::string& paint, double opacity) {
     return parsed;
   }
 
-  if (parsed.normalized.size() >= 6 && parsed.normalized.rfind("url(", 0) == 0) {
-    const std::size_t close = trimmed.find(')', 4);
-    if (close != std::string::npos) {
-      std::string target = trim(trimmed.substr(4, close - 4));
-      if (target.size() >= 2 &&
-          ((target.front() == '\'' && target.back() == '\'') ||
-           (target.front() == '"' && target.back() == '"'))) {
-        target = trim(target.substr(1, target.size() - 2));
-      }
-      if (target.size() > 1 && target.front() == '#') {
-        parsed.kind = PaintKind::Url;
-        parsed.url_id = target.substr(1);
-        parsed.visible = true;
-        return parsed;
-      }
-    }
+  const CssUrlAnalysis urls = analyze_css_urls(trimmed);
+  if (urls.has_url && !urls.has_unsafe_url &&
+      !urls.local_fragment_ids.empty()) {
+    parsed.kind = PaintKind::Url;
+    parsed.url_id = urls.local_fragment_ids.front();
+    parsed.visible = true;
+    return parsed;
   }
 
   parsed.kind = PaintKind::Value;

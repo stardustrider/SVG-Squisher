@@ -81,11 +81,12 @@ Options may appear before or after the two paths. Use `--` before dash-prefixed 
 | --- | --- |
 | `--fill <color>` | Recolors emitted fills and strokes without invoking cleanup. |
 | `--font <path>` | Uses one authoritative font file for all text in the conversion. |
+| `--conversion-policy <preserve-appearance\|filled-paths>` | Selects whether unsupported stroke outlines stay live for fidelity or count as a filled-path fallback. The default is `preserve-appearance`. |
 | `--precision <0-15>` | Sets generated coordinate precision; the default is 4. |
 | `--remove-background` | Applies the opt-in icon background heuristic. It can remove intentional large dark or gradient geometry, so review the result. |
 | `--strict` | Fails before writing output when the capability scan emits any warning. |
 | `--in-place` | Explicitly permits the input and output to resolve to the same path. Replacement still uses the checked temporary-file write. |
-| `--recursive` | Includes SVGs below nested input directories and preserves their relative paths. |
+| `--recursive` | Includes regular SVG files below nested input directories and preserves their relative paths. Directory scans never follow symlinks; SVG symlink entries are reported as skipped. The selected output root may itself be a link, but links and reparse points beneath its resolved location are rejected as failed destinations. |
 | `--fail-fast` | Stops a directory run after its first failed file. The default is to continue. |
 | `--no-overwrite` | Skips existing destinations. A run containing skips returns a nonzero exit status. |
 | `--overwrite` | Replaces existing destinations; this is the default. |
@@ -98,21 +99,23 @@ A successful file conversion returns 0. Input and output paths that resolve to t
 
 ## Compatibility and strict conversion
 
-The compatibility profile is the default. It skips malformed path data and content that cannot enter the path model, emits warnings to standard error and the JSON report, and writes the supported remainder. This is useful for reviewing a mixed corpus without losing all successful files because one file needs attention.
+The compatibility profile is the default. It skips malformed path data and content that cannot enter the path model, emits warnings to standard error and the JSON report, and writes the supported remainder. Numeric and unit diagnostics state the exact compatible action, such as a substituted default, an ignored text position list, or dropped geometry. This is useful for reviewing a mixed corpus without losing all successful files because one file needs attention.
+
+The conversion policy is a separate choice. `--conversion-policy preserve-appearance` is the default and keeps a live stroke when outlining it would lose behavior, including dashed strokes. `--conversion-policy filled-paths` requests fill-only geometry. Supported solid strokes become outlines; when an outline cannot be produced, compatible conversion emits `live-stroke-retained` and states that it retained SVG stroke attributes. Combining `filled-paths` with `--strict` rejects that fallback before output is serialized.
 
 `--strict` uses the same converter after a capability preflight. If preflight emits a warning, conversion fails and no destination file is replaced. Strict mode covers the known boundaries listed in [docs/SUPPORT.md](docs/SUPPORT.md); it is not a claim of full SVG 2 conformance.
 
-The preflight classifies unsupported declarations in inline `style` attributes and embedded stylesheets with the same `unsupported-css-property` diagnostic. External `url(...)` targets receive `unsupported-external-reference`; compatible output removes them, while strict conversion rejects the file. Independently of the selected profile, input is limited to 256 nested element levels including the root `svg`; deeper documents fail before recursive scans or conversion begin. Expanded `use` traversal has the same 256-level combined depth limit, a 64-reference limit, a 16,384-element visit budget, and an 8,192-output-path budget. Compatible mode truncates a branch or the remaining expansion with a diagnostic; strict mode rejects it during preflight.
+The preflight classifies unsupported declarations in inline `style` attributes and embedded stylesheets with the same `unsupported-css-property` diagnostic. URL classification decodes CSS escapes and handles comments, casing, quotes, and whitespace before accepting only a local `#fragment`; external or malformed `url(...)` targets receive `unsupported-external-reference`. Compatible output removes them, while strict conversion rejects the file. Local opacity on a container, link, or text expansion that produces multiple painted layers receives a compositing warning because compatible output distributes that opacity; opacity around one painted element remains supported. Independently of the selected profile, input is limited to 256 nested element levels including the root `svg`; deeper documents fail before recursive scans or conversion begin. Expanded `use` traversal has the same 256-level combined depth limit, a 64-reference limit, a 16,384-element visit budget, and an exact 8,192-output-path budget. Reference, depth, and expanded-node limits are checked during preflight. The output-path limit is enforced while paths are produced, so fill-only and hidden elements are counted according to actual emission. Compatible mode truncates bounded output with a diagnostic; strict mode rejects it before serialization.
 
 ## Reproducible text
 
-`--font` is authoritative: CSS `font-family`, `font-weight`, and `font-style` cannot replace it. Reproducible output requires the same font bytes, converter version, platform architecture, options, and input. Each report entry retains the actual font paths in `fonts` and adds `fontIdentities` with the byte size and SHA-256 of every exact font file used. The report identifies font bytes without embedding or redistributing them. If an identity cannot be read consistently, conversion emits `font-identity-unavailable`; compatibility mode records null size/hash values and the read error, while strict mode rejects the warning.
+`--font` is authoritative: CSS `font-family`, `font-weight`, and `font-style` cannot replace it. Reproducible output requires the same font bytes, converter version, platform architecture, options, and input. Font files are loaded into owned byte snapshots used by FreeType and HarfBuzz, and each report entry records the matching byte size and SHA-256 in `fontIdentities` alongside the path in `fonts`. An unreadable or invalid snapshot fails conversion; every successfully shaped snapshot is reported from the exact owned bytes used for shaping. The report identifies those bytes without embedding or redistributing them.
 
 Without `--font`, SVG Squisher searches a small set of common system font locations and may choose different files on different computers. Text using implicit font selection receives a warning, so strict text conversion requires `--font`. HarfBuzz provides glyph shaping for ligatures and connected scripts, with script and direction inferred per text run. Parent `x`, `y`, `dx`, and `dy` lists are consumed in logical tree order across nested `tspan` content. The current text model does not implement `textPath`, full paragraph bidi layout, vertical text, automatic multi-font fallback, variable-font axis selection, or complete SVG 2 per-character positioning inside multi-codepoint shaped clusters. Font collections use their first face.
 
 ## JSON report
 
-Reports use schema version 1, described by [docs/report-schema-v1.json](docs/report-schema-v1.json). They identify the generator and `generatorVersion`, contain the exact options and aggregate totals, and include one entry per attempted file with:
+Reports use schema version 1, described by [docs/report-schema-v1.json](docs/report-schema-v1.json). They identify the generator and `generatorVersion`, contain the exact options including `conversionPolicy`, and include aggregate totals plus one entry per attempted file with:
 
 - input and output paths;
 - `converted`, `failed`, or `skipped` status;
@@ -172,6 +175,7 @@ Use the result-bearing API when diagnostics or statistics matter:
 
 svg_squisher::SvgSquisher converter;
 svg_squisher::Options options;
+options.conversion_policy = svg_squisher::ConversionPolicy::FilledPaths;
 options.strict = true;
 options.precision = 6;
 
@@ -221,6 +225,7 @@ For measured optimization work, the benchmark harness records byte size, path co
 npm run benchmark -- \
   --corpus tests/visual/fixtures \
   --squisher "$PWD/build/svg_squisher" \
+  --font auto \
   --strict \
   --output benchmark-report.json
 ```
@@ -229,14 +234,14 @@ See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for controlled-run guidance, ba
 
 ## Release targets
 
-Tagged releases build and test four archives whose names state the tested platform baseline and architecture:
+Tagged releases build and test four assets whose names state the tested platform baseline and architecture:
 
 - `svg-squisher-vX.Y.Z-linux-ubuntu-24.04-x86_64.tar.gz`
 - `svg-squisher-vX.Y.Z-windows-2025-x86_64.zip`
-- `svg-squisher-vX.Y.Z-macos-15-arm64.tar.gz`
-- `svg-squisher-vX.Y.Z-macos-15-x86_64.tar.gz`
+- `svg-squisher-vX.Y.Z-macos-15-arm64.dmg`
+- `svg-squisher-vX.Y.Z-macos-15-x86_64.dmg`
 
-Each archive contains the executable, README, project license, and third-party notices. The workflow extracts every finished archive and converts a strict fixture before publishing it. These names identify the build and test baseline; compatibility with an older operating system is not asserted.
+Each asset contains the executable, README, project license, and third-party notices. The macOS executables and disk images require Developer ID signatures, successful Apple notarization, and stapled tickets. The workflow extracts or mounts every finished asset and converts a strict fixture before publishing it. These names identify the build and test baseline; compatibility with an older operating system is not asserted.
 
 ## License
 

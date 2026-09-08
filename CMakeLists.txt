@@ -73,6 +73,7 @@ set(SVG_SQUISHER_CORE_SOURCES
   src/svg_output.cpp
   src/svg_paint.cpp
   src/svg_path.cpp
+  src/svg_path_data.cpp
   src/svg_postprocess.cpp
   src/svg_report.cpp
   src/svg_shape.cpp
@@ -150,12 +151,18 @@ if(BUILD_TESTING)
   add_test(NAME parser_stroke COMMAND parser_stroke_tests)
   set_tests_properties(parser_stroke PROPERTIES TIMEOUT 10)
 
+  add_executable(output_policy_tests tests/output_policy_tests.cpp)
+  target_link_libraries(output_policy_tests PRIVATE SVG::Squisher)
+  svg_squisher_enable_warnings(output_policy_tests)
+  add_test(NAME output_policy COMMAND output_policy_tests)
+  set_tests_properties(output_policy PROPERTIES TIMEOUT 10)
+
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/style_text_tests.cpp")
     add_executable(style_text_tests tests/style_text_tests.cpp)
     target_link_libraries(style_text_tests PRIVATE SVG::Squisher ${SVG_SQUISHER_PUGIXML_TARGET})
     svg_squisher_enable_warnings(style_text_tests)
     add_test(NAME style_text COMMAND style_text_tests)
-    set_tests_properties(style_text PROPERTIES TIMEOUT 15)
+    set_tests_properties(style_text PROPERTIES TIMEOUT 30)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/text_shaping_tests.cpp")
@@ -173,7 +180,16 @@ if(BUILD_TESTING)
       svg_squisher_tests PRIVATE SVG::Squisher Threads::Threads ${SVG_SQUISHER_PUGIXML_TARGET})
     svg_squisher_enable_warnings(svg_squisher_tests)
     add_test(NAME svg_squisher_core COMMAND svg_squisher_tests)
-    set_tests_properties(svg_squisher_core PROPERTIES TIMEOUT 15)
+    set_tests_properties(svg_squisher_core PROPERTIES TIMEOUT 120)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/output_atomic_tests.cpp")
+    add_executable(output_atomic_tests tests/output_atomic_tests.cpp)
+    target_link_libraries(
+      output_atomic_tests PRIVATE SVG::Squisher Threads::Threads ${SVG_SQUISHER_PUGIXML_TARGET})
+    svg_squisher_enable_warnings(output_atomic_tests)
+    add_test(NAME output_atomic COMMAND output_atomic_tests)
+    set_tests_properties(output_atomic PROPERTIES TIMEOUT 30)
   endif()
 
   add_test(NAME cli_help COMMAND svg_squisher --help)

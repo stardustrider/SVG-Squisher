@@ -13,8 +13,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify tagged commit belongs to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Tag $GITHUB_REF_NAME points to a commit outside origin/main." >&2
+            exit 1
+          fi
+
+      - name: Verify tag matches the project version
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_version="$(sed -nE 's/^project\(svg_squisher VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
+          if [[ -z "$project_version" || "$GITHUB_REF_NAME" != "v$project_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match CMake project version ${project_version:-<missing>}." >&2
+            exit 1
+          fi
+
+  quality:
+    name: Full release quality gate
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
   package:
     name: ${{ matrix.platform }} / ${{ matrix.arch }}
+    needs: quality
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
@@ -37,28 +76,18 @@ jobs:
             platform: macos-15
             arch: arm64
             binary: build/svg_squisher
-            archive_ext: tar.gz
+            archive_ext: dmg
             cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
           - runner: macos-15-intel
             platform: macos-15
             arch: x86_64
             binary: build/svg_squisher
-            archive_ext: tar.gz
+            archive_ext: dmg
             cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Verify tag matches the project version
-        shell: bash
-        run: |
-          set -euo pipefail
-          project_version="$(sed -nE 's/^project\(svg_squisher VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
-          if [[ -z "$project_version" || "$GITHUB_REF_NAME" != "v$project_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match CMake project version ${project_version:-<missing>}." >&2
-            exit 1
-          fi
 
       - name: Configure
         run: >-
@@ -86,8 +115,8 @@ jobs:
           Copy-Item third_party/licenses -Destination "$root/third_party/licenses" -Recurse
           Compress-Archive -Path $root -DestinationPath "$root.zip"
 
-      - name: Stage and package Unix archive
-        if: runner.os != 'Windows'
+      - name: Stage and package Linux archive
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -98,6 +127,109 @@ jobs:
           cp README.md LICENSE THIRD_PARTY_NOTICES.md "$root/"
           cp -R third_party/licenses "$root/third_party/licenses"
           tar -czf "$root.tar.gz" "$root"
+
+      - name: Sign and package macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_APPLICATION_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64" || { echo "Missing APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64." >&2; exit 1; }
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" || { echo "Missing APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD." >&2; exit 1; }
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" || { echo "Missing APPLE_DEVELOPER_ID_APPLICATION_IDENTITY." >&2; exit 1; }
+          test -n "$APPLE_NOTARY_KEY_ID" || { echo "Missing APPLE_NOTARY_KEY_ID." >&2; exit 1; }
+          test -n "$APPLE_NOTARY_ISSUER_ID" || { echo "Missing APPLE_NOTARY_ISSUER_ID." >&2; exit 1; }
+          test -n "$APPLE_NOTARY_PRIVATE_KEY_BASE64" || { echo "Missing APPLE_NOTARY_PRIVATE_KEY_BASE64." >&2; exit 1; }
+
+          certificate="$RUNNER_TEMP/developer-id-application.p12"
+          keychain="$RUNNER_TEMP/svg-squisher-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f "$certificate"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64" |
+            openssl base64 -d -A -out "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain"
+
+          codesign --force --options runtime --timestamp \
+            --keychain "$keychain" \
+            --sign "$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" \
+            "${{ matrix.binary }}"
+          codesign --verify --strict --verbose=2 "${{ matrix.binary }}"
+          codesign -dv --verbose=4 "${{ matrix.binary }}" 2>&1 |
+            grep -F "Authority=Developer ID Application:"
+
+          root="svg-squisher-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$root/third_party"
+          cp "${{ matrix.binary }}" "$root/svg_squisher"
+          chmod +x "$root/svg_squisher"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "$root/"
+          cp -R third_party/licenses "$root/third_party/licenses"
+          hdiutil create -quiet -ov -format UDZO -volname "SVG Squisher ${{ github.ref_name }}" \
+            -srcfolder "$root" "$root.dmg"
+          codesign --force --timestamp \
+            --keychain "$keychain" \
+            --sign "$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" "$root.dmg"
+          codesign --verify --strict --verbose=2 "$root.dmg"
+
+      - name: Notarize and staple macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          root="svg-squisher-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          private_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          result="$RUNNER_TEMP/notary-result-${{ matrix.arch }}.json"
+          cleanup() { rm -f "$private_key"; }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY_BASE64" |
+            openssl base64 -d -A -out "$private_key"
+          chmod 600 "$private_key"
+          if ! xcrun notarytool submit "$root.dmg" \
+            --key "$private_key" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait --output-format json > "$result"; then
+            cat "$result"
+            exit 1
+          fi
+          cat "$result"
+
+          status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$result")"
+          submission_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$result")"
+          if [[ "$status" != "Accepted" ]]; then
+            xcrun notarytool log "$submission_id" \
+              --key "$private_key" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" || true
+            exit 1
+          fi
+
+          xcrun stapler staple -v "$root.dmg"
+          xcrun stapler validate -v "$root.dmg"
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "$root.dmg"
 
       - name: Extract and smoke-test Windows archive
         if: runner.os == 'Windows'
@@ -119,8 +251,8 @@ jobs:
             throw "Extracted executable did not produce the expected path output."
           }
 
-      - name: Extract and smoke-test Unix archive
-        if: runner.os != 'Windows'
+      - name: Extract and smoke-test Linux archive
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -129,6 +261,25 @@ jobs:
           mkdir smoke
           tar -xzf "$root.tar.gz" -C smoke
           executable="smoke/$root/svg_squisher"
+          "$executable" --version | grep -F "${GITHUB_REF_NAME#v}"
+          "$executable" tests/visual/fixtures/implicit-moveto.svg smoke/result.svg --strict --precision 6
+          grep -Fq '<path ' smoke/result.svg
+
+      - name: Mount and smoke-test notarized macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="svg-squisher-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          mount_point="$RUNNER_TEMP/svg-squisher-${{ matrix.arch }}-mount"
+          mkdir -p "$mount_point" smoke
+          cleanup() { hdiutil detach "$mount_point" -quiet || true; }
+          trap cleanup EXIT
+
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount_point" "$root.dmg"
+          executable="$mount_point/svg_squisher"
+          codesign --verify --strict --verbose=2 "$executable"
+          spctl --assess --type execute --verbose=4 "$executable"
           "$executable" --version | grep -F "${GITHUB_REF_NAME#v}"
           "$executable" tests/visual/fixtures/implicit-moveto.svg smoke/result.svg --strict --precision 6
           grep -Fq '<path ' smoke/result.svg

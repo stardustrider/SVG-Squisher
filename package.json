@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "benchmark": "node benchmarks/benchmark.mjs",
-    "test": "npm run test:compare",
+    "test": "npm run test:compare && npm run test:benchmark",
+    "test:benchmark": "node --test tests/benchmark_test.mjs",
     "test:compare": "node tests/compare_page_test.mjs",
     "test:visual": "node tests/visual/visual-regression.mjs"
   },

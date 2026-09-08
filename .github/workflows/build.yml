@@ -7,6 +7,7 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -117,8 +118,8 @@ jobs:
       - name: Install locked visual-test dependencies
         run: npm ci
 
-      - name: Test comparison report page
-        run: node --test tests/compare_page_test.mjs
+      - name: Test JavaScript harnesses
+        run: npm test
 
       - name: Render and compare fixtures
         env:

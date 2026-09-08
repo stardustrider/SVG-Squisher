@@ -6,11 +6,11 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <mutex>
-#include <optional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -158,118 +158,70 @@ private:
   std::uint64_t total_bytes_ = 0;
 };
 
-struct FileSnapshot {
-  std::uintmax_t bytes = 0;
-  fs::file_time_type modified;
-};
-
-struct CachedIdentity {
-  FileSnapshot snapshot;
-  std::string sha256;
-};
-
-struct StreamedIdentity {
-  std::uintmax_t bytes = 0;
-  std::string sha256;
-  std::string error;
-};
-
-std::mutex identity_cache_mutex;
-std::unordered_map<std::string, CachedIdentity> identity_cache;
-constexpr std::size_t max_cached_identities = 128;
-
-bool same_snapshot(const FileSnapshot& left, const FileSnapshot& right) {
-  return left.bytes == right.bytes && left.modified == right.modified;
-}
-
-std::optional<FileSnapshot> snapshot_file(const fs::path& path,
-                                          const std::string& display_path,
-                                          std::string& error) {
+bool inspect_font_file(const fs::path& path,
+                       const std::string& display_path,
+                       std::string& error) {
   std::error_code status_error;
   const fs::file_status status = fs::status(path, status_error);
   if (status_error) {
     error = "Could not inspect font file '" + display_path + "': " + status_error.message();
-    return std::nullopt;
+    return false;
   }
   if (!fs::exists(status)) {
     error = "Font file does not exist: '" + display_path + "'";
-    return std::nullopt;
+    return false;
   }
   if (!fs::is_regular_file(status)) {
     error = "Font path is not a regular file: '" + display_path + "'";
-    return std::nullopt;
+    return false;
   }
-
-  std::error_code size_error;
-  const std::uintmax_t bytes = fs::file_size(path, size_error);
-  if (size_error) {
-    error = "Could not read font file size for '" + display_path + "': " +
-            size_error.message();
-    return std::nullopt;
-  }
-
-  std::error_code time_error;
-  const fs::file_time_type modified = fs::last_write_time(path, time_error);
-  if (time_error) {
-    error = "Could not read font modification time for '" + display_path + "': " +
-            time_error.message();
-    return std::nullopt;
-  }
-  return FileSnapshot{bytes, modified};
+  return true;
 }
 
-std::optional<std::string> find_cached_identity(const std::string& key,
-                                                const FileSnapshot& snapshot) {
-  const std::lock_guard<std::mutex> lock(identity_cache_mutex);
-  const auto cached = identity_cache.find(key);
-  if (cached == identity_cache.end() ||
-      !same_snapshot(cached->second.snapshot, snapshot)) {
-    return std::nullopt;
-  }
-  return cached->second.sha256;
-}
+FontData read_font_data(const fs::path& path, const std::string& display_path) {
+  FontData result;
+  result.identity.path = display_path;
+  if (!inspect_font_file(path, display_path, result.identity.error)) return result;
 
-void cache_identity(const std::string& key,
-                    const FileSnapshot& snapshot,
-                    const std::string& sha256) {
-  const std::lock_guard<std::mutex> lock(identity_cache_mutex);
-  if (identity_cache.find(key) == identity_cache.end() &&
-      identity_cache.size() >= max_cached_identities) {
-    identity_cache.erase(identity_cache.begin());
-  }
-  identity_cache[key] = CachedIdentity{snapshot, sha256};
-}
-
-StreamedIdentity hash_file(const fs::path& path, const std::string& display_path) {
   std::ifstream input(path, std::ios::binary);
   if (!input.is_open()) {
-    return StreamedIdentity{0, {}, "Could not open font file for hashing: '" +
-                                       display_path + "'"};
+    result.identity.error = "Could not open font file for reading: '" + display_path + "'";
+    return result;
+  }
+
+  auto bytes = std::make_shared<std::vector<unsigned char>>();
+  std::error_code size_error;
+  const std::uintmax_t expected_size = fs::file_size(path, size_error);
+  if (!size_error && expected_size <= std::numeric_limits<std::size_t>::max()) {
+    bytes->reserve(static_cast<std::size_t>(expected_size));
   }
 
   Sha256 hash;
-  std::array<char, 64 * 1024> buffer{};
-  std::uintmax_t bytes = 0;
+  std::array<unsigned char, 64 * 1024> buffer{};
   while (true) {
-    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    input.read(reinterpret_cast<char*>(buffer.data()),
+               static_cast<std::streamsize>(buffer.size()));
     const std::streamsize count = input.gcount();
     if (count > 0) {
-      const auto unsigned_count = static_cast<std::uintmax_t>(count);
-      if (bytes > std::numeric_limits<std::uintmax_t>::max() - unsigned_count) {
-        return StreamedIdentity{0, {}, "Font file is too large to count safely: '" +
-                                           display_path + "'"};
+      const std::size_t amount = static_cast<std::size_t>(count);
+      if (bytes->size() > std::numeric_limits<std::size_t>::max() - amount) {
+        result.identity.error = "Font file is too large to load safely: '" + display_path + "'";
+        return result;
       }
-      bytes += unsigned_count;
-      hash.update(reinterpret_cast<const unsigned char*>(buffer.data()),
-                  static_cast<std::size_t>(count));
+      bytes->insert(bytes->end(), buffer.begin(), buffer.begin() + count);
+      hash.update(buffer.data(), amount);
     }
     if (input.eof()) break;
     if (!input) {
-      return StreamedIdentity{0, {}, "Could not finish reading font file: '" +
-                                         display_path + "'"};
+      result.identity.error = "Could not finish reading font file: '" + display_path + "'";
+      return result;
     }
   }
-  return StreamedIdentity{bytes, hash.finish(), {}};
+
+  result.identity.bytes = static_cast<std::uintmax_t>(bytes->size());
+  result.identity.sha256 = hash.finish();
+  result.bytes = std::move(bytes);
+  return result;
 }
 
 bool normalize_font_path(const std::string& utf8_path,
@@ -300,69 +252,65 @@ bool normalize_font_path(const std::string& utf8_path,
 
 }  // namespace
 
-FontIdentity identify_font_file(const std::string& utf8_path) {
-  FontIdentity result;
-  result.path = utf8_path;
+struct FontSnapshotState {
+  std::unordered_map<std::string, FontData> fonts;
+  std::vector<std::string> load_order;
+};
+
+thread_local FontSnapshotState* active_font_snapshot = nullptr;
+
+FontSnapshotScope::FontSnapshotScope()
+    : state_(std::make_unique<FontSnapshotState>()),
+      previous_(active_font_snapshot) {
+  active_font_snapshot = state_.get();
+}
+
+FontSnapshotScope::~FontSnapshotScope() {
+  active_font_snapshot = previous_;
+}
+
+std::vector<FontIdentity> FontSnapshotScope::identities() const {
+  std::vector<FontIdentity> result;
+  result.reserve(state_->load_order.size());
+  for (const std::string& key : state_->load_order) {
+    const auto font = state_->fonts.find(key);
+    if (font != state_->fonts.end() && font->second.bytes) {
+      result.push_back(font->second.identity);
+    }
+  }
+  return result;
+}
+
+FontData load_font_data(const std::string& utf8_path) {
+  FontData result;
+  result.identity.path = utf8_path;
 
   fs::path normalized;
   std::string cache_key;
-  if (!normalize_font_path(utf8_path, normalized, cache_key, result.error)) return result;
+  if (!normalize_font_path(
+        utf8_path, normalized, cache_key, result.identity.error)) {
+    return result;
+  }
 
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    std::string snapshot_error;
-    const std::optional<FileSnapshot> before =
-        snapshot_file(normalized, utf8_path, snapshot_error);
-    if (!before) {
-      result.error = std::move(snapshot_error);
-      return result;
-    }
-
-    const std::optional<std::string> cached = find_cached_identity(cache_key, *before);
-    if (cached) {
-      const std::optional<FileSnapshot> after =
-          snapshot_file(normalized, utf8_path, snapshot_error);
-      if (!after) {
-        if (attempt == 0) continue;
-        result.error = std::move(snapshot_error);
-        return result;
-      }
-      if (same_snapshot(*before, *after)) {
-        result.bytes = before->bytes;
-        result.sha256 = *cached;
-        return result;
-      }
-    } else {
-      const StreamedIdentity streamed = hash_file(normalized, utf8_path);
-      if (!streamed.error.empty()) {
-        if (attempt == 0) continue;
-        result.error = streamed.error;
-        return result;
-      }
-
-      const std::optional<FileSnapshot> after =
-          snapshot_file(normalized, utf8_path, snapshot_error);
-      if (!after) {
-        if (attempt == 0) continue;
-        result.error = std::move(snapshot_error);
-        return result;
-      }
-      if (streamed.bytes == before->bytes && same_snapshot(*before, *after)) {
-        cache_identity(cache_key, *after, streamed.sha256);
-        result.bytes = streamed.bytes;
-        result.sha256 = streamed.sha256;
-        return result;
-      }
-    }
-
-    if (attempt == 1) {
-      result.error = "Font file changed while its identity was being computed: '" +
-                     utf8_path + "'";
+  if (active_font_snapshot) {
+    const auto cached = active_font_snapshot->fonts.find(cache_key);
+    if (cached != active_font_snapshot->fonts.end()) {
+      result = cached->second;
+      result.identity.path = utf8_path;
       return result;
     }
   }
 
-  result.error = "Could not compute font identity: '" + utf8_path + "'";
+  result = read_font_data(normalized, utf8_path);
+  if (active_font_snapshot && result.bytes) {
+    active_font_snapshot->load_order.push_back(cache_key);
+    active_font_snapshot->fonts.emplace(cache_key, result);
+  }
   return result;
+}
+
+FontIdentity identify_font_file(const std::string& utf8_path) {
+  return load_font_data(utf8_path).identity;
 }
 
 }  // namespace svg_squisher

@@ -16,6 +16,10 @@ const diffDirectory = resolve(process.env.SVG_SQUISHER_DIFF_DIR || join(work, "d
 
 // Exact-preservation fixtures allow at most 0.05% changed pixels. Element opacity
 // gets 0.10%, dashed stroke approximation 0.60%, and curve fallback 2.00%.
+// Straight post-close stroke reconstruction uses the exact-preservation budget;
+// the focused closed-curve fallback allows 0.50% for adaptive offset approximation.
+// Zero-length caps exercise round, square, butt, and closed subpaths under transforms.
+// Immediate retraces and thick eccentric ellipse offsets use exact-preservation budgets.
 // Text compares the same explicit font file in both renders and allows 0.40% for
 // FreeType/HarfBuzz versus resvg rasterization and hinting differences.
 const cases = [
@@ -25,11 +29,18 @@ const cases = [
   { name: "implicit-moveto.svg", maxRatio: 0.0005 },
   { name: "root-transform.svg", maxRatio: 0.0005 },
   { name: "symbol-use.svg", maxRatio: 0.0005 },
+  { name: "symbol-use-auto-size.svg", maxRatio: 0.0005 },
   { name: "pattern-css.svg", maxRatio: 0.0005 },
   { name: "gradient-viewbox.svg", maxRatio: 0.0005 },
   { name: "dashed-circle.svg", maxRatio: 0.006 },
+  { name: "post-close-continuation.svg", maxRatio: 0.0005 },
   { name: "stroked-curve.svg", maxRatio: 0.02 },
+  { name: "closed-curve.svg", maxRatio: 0.005 },
+  { name: "zero-length-caps.svg", maxRatio: 0.0005 },
+  { name: "retraced-stroke.svg", maxRatio: 0.0005 },
+  { name: "eccentric-ellipse-stroke.svg", maxRatio: 0.0005 },
   { name: "text-shaping.svg", maxRatio: 0.004, requiresFont: true },
+  { name: "text-tspan-shaping.svg", maxRatio: 0.004, requiresFont: true },
 ];
 
 const fontCandidates = [

@@ -7,6 +7,10 @@
 #include <thread>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 #include "svg_diagnostics.h"
 #include "svg_output.h"
 #include "svg_report.h"
@@ -29,6 +33,17 @@ bool contains_diagnostic(const svg_squisher::ConversionResult& result,
                          const std::string& code) {
   for (const auto& diagnostic : result.diagnostics) {
     if (diagnostic.code == code) return true;
+  }
+  return false;
+}
+
+bool diagnostic_message_contains(const svg_squisher::ConversionResult& result,
+                                 const std::string& code,
+                                 const std::string& text) {
+  for (const auto& diagnostic : result.diagnostics) {
+    if (diagnostic.code == code && diagnostic.message.find(text) != std::string::npos) {
+      return true;
+    }
   }
   return false;
 }
@@ -119,8 +134,53 @@ std::string output_path_budget_attack(std::size_t painted_elements) {
   return svg;
 }
 
+std::string fill_only_elements(std::size_t painted_elements, bool hidden) {
+  std::string svg =
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\">";
+  if (hidden) svg += "<g display=\"none\">";
+  for (std::size_t element = 0; element < painted_elements; ++element) {
+    svg += "<rect width=\"1\" height=\"1\" fill=\"red\"/>";
+  }
+  if (hidden) svg += "</g>";
+  svg += "</svg>";
+  return svg;
+}
+
+std::string zero_radius_circles_with_valid_rect(std::size_t element_count) {
+  std::string svg =
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\">";
+  for (std::size_t element = 0; element < element_count; ++element) {
+    svg += "<circle cx=\"5\" cy=\"5\" r=\"0\" fill=\"red\" "
+           "stroke=\"black\" stroke-width=\"1\"/>";
+  }
+  svg += "<rect width=\"1\" height=\"1\" fill=\"red\"/>";
+  svg += "</svg>";
+  return svg;
+}
+
+std::string repeated_use_instances_before_target(std::size_t instance_count) {
+  std::string svg =
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\">";
+  for (std::size_t instance = 0; instance < instance_count; ++instance) {
+    svg += "<use href=\"#late-target\"/>";
+  }
+  svg +=
+      "<defs><path id=\"late-target\" d=\"M0 0L1 1\" fill=\"none\" "
+      "stroke=\"black\" stroke-dasharray=\"1 1\"/></defs></svg>";
+  return svg;
+}
+
 void test_expanded_traversal_bounds() {
   svg_squisher::SvgSquisher squisher;
+
+  constexpr std::size_t repeated_use_count = 3000;
+  const auto repeated_uses = squisher.convert_string(
+      repeated_use_instances_before_target(repeated_use_count));
+  expect(repeated_uses.success &&
+             repeated_uses.stats.output_paths == repeated_use_count &&
+             !contains_diagnostic(repeated_uses, "expanded-node-limit") &&
+             !contains_diagnostic(repeated_uses, "output-path-limit"),
+         "many use instances resolve a late target within traversal budgets");
 
   const std::string deep_chain = expanded_depth_attack(64, 251);
   const auto compatible_chain = squisher.convert_string(deep_chain);
@@ -159,7 +219,28 @@ void test_expanded_traversal_bounds() {
   const auto strict_output = squisher.convert_string(excessive_output, strict);
   expect(!strict_output.success && strict_output.svg.empty() &&
              strict_output.error.find("output-path-limit") != std::string::npos,
-         "strict mode rejects a predicted output-path budget overflow");
+         "strict mode rejects an exact runtime output-path budget overflow");
+
+  constexpr std::size_t fill_only_count = svg_squisher::kMaxOutputPathCount / 2 + 1;
+  const auto strict_fill_only =
+      squisher.convert_string(fill_only_elements(fill_only_count, false), strict);
+  expect(strict_fill_only.success &&
+             strict_fill_only.stats.output_paths == fill_only_count &&
+             !contains_diagnostic(strict_fill_only, "output-path-limit"),
+         "strict output budgeting counts one emitted path for fill-only geometry");
+
+  const auto strict_hidden =
+      squisher.convert_string(fill_only_elements(fill_only_count, true), strict);
+  expect(strict_hidden.success && strict_hidden.stats.output_paths == 0 &&
+             !contains_diagnostic(strict_hidden, "output-path-limit"),
+         "strict output budgeting ignores geometry suppressed by display none");
+
+  const auto strict_degenerate = squisher.convert_string(
+      zero_radius_circles_with_valid_rect(
+          svg_squisher::kMaxOutputPathCount / 2 + 1), strict);
+  expect(strict_degenerate.success && strict_degenerate.stats.output_paths == 1 &&
+             !contains_diagnostic(strict_degenerate, "output-path-limit"),
+         "strict output budgeting ignores zero-radius geometry that emits no paths");
 
   const std::string overlapping_use = root(
       "<defs><g id=\"overlap\"><rect width=\"8\" height=\"8\"/>"
@@ -175,6 +256,210 @@ void test_expanded_traversal_bounds() {
          "strict mode rejects distributed opacity across a use instance");
 }
 
+void test_symbol_viewport_contract() {
+  svg_squisher::SvgSquisher squisher;
+  svg_squisher::Options strict;
+  strict.strict = true;
+
+  const std::string symbol_body =
+    "<defs><symbol id=\"s\" viewBox=\"0 0 20 10\" overflow=\"visible\">"
+    "<rect width=\"20\" height=\"10\"/></symbol></defs>";
+  const auto automatic_root_size = squisher.convert_string(
+    root(symbol_body + "<use href=\"#s\" x=\"10\" y=\"15\"/>"), strict);
+  const auto explicit_root_size = squisher.convert_string(
+    root(symbol_body +
+         "<use href=\"#s\" x=\"10\" y=\"15\" width=\"100\" height=\"100\"/>"),
+    strict);
+  expect(automatic_root_size.success && explicit_root_size.success &&
+             automatic_root_size.svg == explicit_root_size.svg,
+         "automatic use dimensions resolve against the root user-space viewport");
+
+  const auto explicit_auto_size = squisher.convert_string(root(
+    "<defs><symbol id=\"s\" width=\"auto\" height=\"auto\" "
+    "viewBox=\"0 0 20 10\" overflow=\"visible\">"
+    "<rect width=\"20\" height=\"10\"/></symbol></defs>"
+    "<use href=\"#s\" x=\"10\" y=\"15\" width=\"auto\" height=\"auto\"/>"),
+    strict);
+  expect(explicit_auto_size.success && explicit_auto_size.diagnostics.empty() &&
+             explicit_auto_size.svg == automatic_root_size.svg,
+         "explicit auto use and symbol dimensions are equivalent to omission");
+
+  const std::string invalid_root_viewbox_prefix =
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" height=\"60\" "
+    "viewBox=\"0 0 -10 100\"><defs><symbol id=\"s\" viewBox=\"0 0 8 6\" "
+    "overflow=\"visible\"><rect width=\"8\" height=\"6\"/></symbol></defs>";
+  const auto invalid_root_auto = squisher.convert_string(
+    invalid_root_viewbox_prefix + "<use href=\"#s\"/></svg>");
+  const auto invalid_root_explicit = squisher.convert_string(
+    invalid_root_viewbox_prefix +
+      "<use href=\"#s\" width=\"80\" height=\"60\"/></svg>");
+  expect(invalid_root_auto.success && invalid_root_explicit.success &&
+             invalid_root_auto.stats.output_paths == 1 &&
+             invalid_root_auto.svg == invalid_root_explicit.svg,
+         "an invalid negative root viewBox falls back to finite root dimensions for automatic symbol sizing");
+
+  const std::string sized_symbol_body =
+    "<defs><symbol id=\"s\" width=\"40\" height=\"30\" "
+    "viewBox=\"0 0 20 10\" overflow=\"visible\">"
+    "<rect width=\"20\" height=\"10\"/></symbol></defs>";
+  const auto inherited_symbol_size = squisher.convert_string(
+    root(sized_symbol_body + "<use href=\"#s\" width=\"60\"/>"), strict);
+  const auto explicit_symbol_size = squisher.convert_string(
+    root(sized_symbol_body +
+         "<use href=\"#s\" width=\"60\" height=\"30\"/>"),
+    strict);
+  expect(inherited_symbol_size.success && explicit_symbol_size.success &&
+             inherited_symbol_size.svg == explicit_symbol_size.svg,
+         "use dimensions override explicit symbol dimensions one axis at a time");
+
+  const auto display_on_definition = squisher.convert_string(root(
+    "<defs><symbol id=\"displayed\" viewBox=\"0 0 10 10\" display=\"none\" "
+    "overflow=\"visible\"><rect width=\"10\" height=\"10\"/></symbol></defs>"
+    "<use href=\"#displayed\" width=\"10\" height=\"10\"/>"), strict);
+  expect(display_on_definition.success &&
+             display_on_definition.stats.output_paths == 1,
+         "a generated symbol instance uses display inline regardless of display on its definition");
+
+  const auto displayed_symbol_layers = squisher.convert_string(root(
+    "<defs><symbol id=\"layers\" viewBox=\"0 0 10 10\" display=\"none\" "
+    "overflow=\"visible\"><rect width=\"8\" height=\"8\"/>"
+    "<rect x=\"2\" y=\"2\" width=\"8\" height=\"8\"/></symbol></defs>"
+    "<use href=\"#layers\" width=\"10\" height=\"10\" opacity=\".5\"/>"));
+  expect(displayed_symbol_layers.success &&
+             contains_diagnostic(displayed_symbol_layers, "use-opacity-flattened"),
+         "symbol instance opacity diagnostics also honor the generated display-inline value");
+
+  const std::string contained_symbol = root(
+    "<defs><symbol id=\"inside\" viewBox=\"0 0 20 10\">"
+    "<rect width=\"20\" height=\"10\"/></symbol></defs>"
+    "<use href=\"#inside\" width=\"60\" height=\"70\"/>");
+  const auto contained = squisher.convert_string(contained_symbol, strict);
+  expect(contained.success &&
+             !contains_diagnostic(contained, "unsupported-symbol-viewport-clipping"),
+         "strict conversion accepts default symbol clipping when generated geometry is proven contained");
+
+  const std::string clipped_symbol = root(
+    "<defs><symbol id=\"clipped\" viewBox=\"0 0 20 10\" "
+    "overflow=\"hidden\" preserveAspectRatio=\"xMaxYMin slice\">"
+    "<rect width=\"20\" height=\"10\"/><circle cx=\"10\" cy=\"5\" r=\"7\"/>"
+    "</symbol></defs><use href=\"#clipped\" x=\"10\" y=\"15\" "
+    "width=\"60\" height=\"70\"/>");
+  const auto compatible_clip = squisher.convert_string(clipped_symbol);
+  expect(compatible_clip.success &&
+             contains_diagnostic(
+               compatible_clip, "unsupported-symbol-viewport-clipping") &&
+             diagnostic_message_contains(
+               compatible_clip,
+               "unsupported-symbol-viewport-clipping",
+               "without the required viewport clip") &&
+             compatible_clip.stats.output_paths == 2,
+         "compatible conversion identifies unclipped symbol overflow and states its fallback");
+  const auto strict_clip = squisher.convert_string(clipped_symbol, strict);
+  expect(!strict_clip.success && strict_clip.svg.empty() &&
+             strict_clip.error.find("unsupported-symbol-viewport-clipping") !=
+               std::string::npos,
+         "strict conversion rejects symbol content that requires viewport clipping");
+
+  const std::string transformed_clip = root(
+    "<defs><symbol id=\"moved\" width=\"10\" height=\"10\" "
+    "transform=\"translate(-100 0)\"><rect x=\"100\" width=\"10\" "
+    "height=\"10\"/></symbol></defs><use href=\"#moved\" width=\"10\" "
+    "height=\"10\"/>");
+  const auto transformed_clip_compatible =
+    squisher.convert_string(transformed_clip);
+  const auto transformed_clip_strict =
+    squisher.convert_string(transformed_clip, strict);
+  expect(transformed_clip_compatible.success &&
+             contains_diagnostic(
+               transformed_clip_compatible,
+               "unsupported-symbol-viewport-clipping") &&
+             !transformed_clip_strict.success,
+         "symbol transforms participate in conservative viewport containment checks");
+
+  std::string visible_overflow = clipped_symbol;
+  const std::size_t hidden = visible_overflow.find("overflow=\"hidden\"");
+  visible_overflow.replace(hidden, std::string("overflow=\"hidden\"").size(),
+                           "overflow=\"visible\"");
+  const auto explicit_visible = squisher.convert_string(visible_overflow, strict);
+  expect(explicit_visible.success &&
+             !contains_diagnostic(
+               explicit_visible, "unsupported-symbol-viewport-clipping"),
+         "explicit visible symbol overflow opts into the converter's unclipped output");
+
+  const std::string styled_overflow = root(
+    "<defs><symbol id=\"styled\" viewBox=\"0 0 10 10\" "
+    "style=\"overflow:visible\"><rect width=\"12\" height=\"10\"/></symbol></defs>"
+    "<use href=\"#styled\" width=\"10\" height=\"10\"/>");
+  const auto diagnosed_overflow_style = squisher.convert_string(styled_overflow);
+  const auto rejected_overflow_style = squisher.convert_string(styled_overflow, strict);
+  expect(diagnosed_overflow_style.success &&
+             contains_diagnostic(
+               diagnosed_overflow_style, "unsupported-css-property") &&
+             !rejected_overflow_style.success &&
+             rejected_overflow_style.error.find("unsupported-css-property") !=
+               std::string::npos,
+         "CSS overflow on a symbol is diagnosed while the supported visible attribute stays explicit");
+
+  const std::string positioned_symbol = root(
+    "<defs><symbol id=\"positioned\" x=\"2\" y=\"3\" width=\"10\" "
+    "height=\"10\" overflow=\"visible\"><rect width=\"10\" "
+    "height=\"10\"/></symbol></defs><use href=\"#positioned\"/>");
+  const auto positioned_compatible = squisher.convert_string(positioned_symbol);
+  const auto positioned_strict = squisher.convert_string(positioned_symbol, strict);
+  expect(positioned_compatible.success &&
+             diagnostic_message_contains(
+               positioned_compatible,
+               "unsupported-symbol-position",
+               "applies only x/y from this use") &&
+             !positioned_strict.success &&
+             positioned_strict.error.find("unsupported-symbol-position") !=
+               std::string::npos,
+         "referenced symbol x/y has an explicit compatible fallback and strict rejection");
+
+  const std::string unprovable_stroke = root(
+    "<defs><symbol id=\"live\" viewBox=\"0 0 20 10\">"
+    "<path d=\"M2 5H18\" fill=\"none\" stroke=\"black\" "
+    "stroke-dasharray=\"1 1\"/></symbol></defs>"
+    "<use href=\"#live\" width=\"20\" height=\"10\"/>");
+  const auto unprovable = squisher.convert_string(unprovable_stroke);
+  expect(unprovable.success &&
+             diagnostic_message_contains(
+               unprovable,
+               "unsupported-symbol-viewport-clipping",
+               "could not be proven"),
+         "live-stroked symbol geometry is diagnosed when viewport containment cannot be proven");
+
+  const std::string nested_automatic = root(
+    "<defs>"
+    "<symbol id=\"inner\" viewBox=\"0 0 10 10\" overflow=\"visible\">"
+    "<rect width=\"10\" height=\"10\"/></symbol>"
+    "<symbol id=\"outer\" viewBox=\"0 0 20 20\" overflow=\"visible\">"
+    "<use href=\"#inner\"/></symbol>"
+    "</defs><use href=\"#outer\" width=\"20\" height=\"20\"/>");
+  const auto nested = squisher.convert_string(nested_automatic);
+  expect(nested.success &&
+             diagnostic_message_contains(
+               nested,
+               "unsupported-nested-symbol-viewport",
+               "resolves that automatic dimension against the root SVG viewport"),
+         "nested automatic symbol dimensions receive a deterministic root-viewport diagnostic");
+
+  const std::string indirectly_nested_automatic = root(
+    "<defs>"
+    "<symbol id=\"inner-indirect\" viewBox=\"0 0 10 10\" overflow=\"visible\">"
+    "<rect width=\"10\" height=\"10\"/></symbol>"
+    "<g id=\"bridge\"><use href=\"#inner-indirect\"/></g>"
+    "<symbol id=\"outer-indirect\" viewBox=\"0 0 20 20\" overflow=\"visible\">"
+    "<use href=\"#bridge\"/></symbol>"
+    "</defs><use href=\"#outer-indirect\" width=\"20\" height=\"20\"/>");
+  const auto indirectly_nested =
+    squisher.convert_string(indirectly_nested_automatic);
+  expect(indirectly_nested.success &&
+             contains_diagnostic(
+               indirectly_nested, "unsupported-nested-symbol-viewport"),
+         "active symbol-instance context diagnoses nested auto sizing through a referenced group");
+}
+
 void test_exclusive_atomic_file_writes() {
   const fs::path temporary = fs::temp_directory_path() / "svg-squisher-output-safety-tests";
   std::error_code ignored;
@@ -185,7 +470,9 @@ void test_exclusive_atomic_file_writes() {
   const fs::path output = temporary / "symlink-result.svg";
   const fs::path dangling_target = temporary / "must-not-be-created.svg";
   const fs::path stale_temporary =
-      temporary / ".symlink-result.svg.svg-squisher-0.tmp";
+      temporary / (".symlink-result.svg.svg-squisher-" +
+                   std::to_string(static_cast<unsigned long long>(::getpid())) +
+                   "-0.tmp");
   std::error_code symlink_error;
   fs::create_symlink(dangling_target, stale_temporary, symlink_error);
   expect(!symlink_error, "POSIX output safety fixture creates a dangling temporary symlink");
@@ -348,6 +635,20 @@ void test_explicit_conversion_policies() {
   expect(cleaned.success && cleaned.stats.output_paths == 1,
          "background removal runs only when explicitly requested");
 
+  const std::string transformed_gradient = root(
+      "<defs><linearGradient id=\"g\"><stop offset=\"0\" stop-color=\"black\"/>"
+      "<stop offset=\"1\" stop-color=\"gray\"/></linearGradient></defs>"
+      "<path d=\"M0 0H100V100H0Z\" transform=\"scale(.1)\" fill=\"url(#g)\"/>"
+      "<rect x=\"50\" y=\"50\" width=\"10\" height=\"10\" fill=\"red\"/>");
+  svg_squisher::Options transformed_cleanup;
+  transformed_cleanup.remove_background = true;
+  const auto transformed_cleaned =
+      squisher.convert_string(transformed_gradient, transformed_cleanup);
+  expect(transformed_cleaned.success &&
+             transformed_cleaned.stats.output_paths == 2 &&
+             transformed_cleaned.svg.find("url(#g)") != std::string::npos,
+         "background removal classifies retained geometry in output coordinates");
+
   svg_squisher::Options coarse;
   coarse.precision = 1;
   const auto rounded = squisher.convert_string(
@@ -399,6 +700,50 @@ void test_preserved_document_semantics() {
   const auto strict_group = squisher.convert_string(grouped, strict);
   expect(!strict_group.success && strict_group.error.find("group-opacity-flattened") != std::string::npos,
          "strict mode rejects group-compositing changes before output");
+
+  const std::string single_layer_group = root(
+      "<g opacity=\".5\"><rect width=\"70\" height=\"70\" fill=\"red\" "
+      "stroke=\"blue\" stroke-width=\"4\"/></g>");
+  const auto strict_single_layer = squisher.convert_string(single_layer_group, strict);
+  expect(strict_single_layer.success &&
+             !contains_diagnostic(strict_single_layer, "group-opacity-flattened"),
+         "container opacity around one painted element remains supported in strict mode");
+
+  const std::string linked_layers = root(
+      "<a opacity=\".5\"><rect width=\"70\" height=\"70\"/>"
+      "<rect x=\"30\" y=\"30\" width=\"70\" height=\"70\"/></a>");
+  const auto compatible_link = squisher.convert_string(linked_layers);
+  expect(compatible_link.success &&
+             contains_diagnostic(compatible_link, "group-opacity-flattened"),
+         "opacity on a link container with multiple painted layers is diagnosed");
+  const auto strict_link = squisher.convert_string(linked_layers, strict);
+  expect(!strict_link.success &&
+             strict_link.error.find("group-opacity-flattened") != std::string::npos,
+         "strict mode rejects distributed opacity on a link container");
+
+  const std::string text_layers = root(
+      "<text x=\"4\" y=\"40\" opacity=\".5\">first<tspan x=\"4\" "
+      "y=\"60\">second</tspan></text>");
+  const auto compatible_text_layers = squisher.convert_string(text_layers);
+  expect(compatible_text_layers.success &&
+             contains_diagnostic(compatible_text_layers, "group-opacity-flattened"),
+         "opacity across text and tspan chunks is diagnosed");
+  const auto strict_text_layers = squisher.convert_string(text_layers, strict);
+  expect(!strict_text_layers.success &&
+             strict_text_layers.error.find("group-opacity-flattened") != std::string::npos,
+         "strict mode rejects distributed opacity across text chunks");
+
+  const std::string nested_tspan_layers = root(
+      "<text x=\"4\" y=\"40\"><tspan opacity=\".5\">first"
+      "<tspan x=\"4\" y=\"60\">second</tspan></tspan></text>");
+  const auto compatible_tspan_layers = squisher.convert_string(nested_tspan_layers);
+  expect(compatible_tspan_layers.success &&
+             contains_diagnostic(compatible_tspan_layers, "group-opacity-flattened"),
+         "opacity across nested tspan chunks is diagnosed");
+  const auto strict_tspan_layers = squisher.convert_string(nested_tspan_layers, strict);
+  expect(!strict_tspan_layers.success &&
+             strict_tspan_layers.error.find("group-opacity-flattened") != std::string::npos,
+         "strict mode rejects distributed opacity across nested tspan chunks");
 
   const auto viewport = squisher.convert_string(
       "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"-10 -20 100 100\" "
@@ -483,6 +828,32 @@ void test_strict_capability_coverage() {
   svg_squisher::Options strict;
   strict.strict = true;
 
+  const auto compact_points = squisher.convert_string(root(
+      "<polyline points=\"0-10 20-30\" fill=\"none\" stroke=\"black\"/>"),
+      strict);
+  expect(compact_points.success &&
+             !contains_diagnostic(compact_points, "invalid-numeric-value"),
+         "strict mode accepts compact negative coordinates in points lists");
+
+  const auto zero_viewbox = squisher.convert_string(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 0 10\">"
+      "<rect width=\"10\" height=\"10\"/></svg>",
+      strict);
+  expect(zero_viewbox.success &&
+             !contains_diagnostic(zero_viewbox, "invalid-numeric-value"),
+         "strict mode accepts a zero viewBox dimension that disables rendering");
+
+  const auto intentionally_empty = squisher.convert_string(root(
+      "<defs><g id=\"empty-definition\"/></defs>"
+      "<circle r=\"0\"/><ellipse rx=\"0\" ry=\"4\"/>"
+      "<rect width=\"0\" height=\"10\"/><path d=\"\"/>"
+      "<polyline points=\"\"/><polygon points=\"\"/>"
+      "<use href=\"#empty-definition\"/>"), strict);
+  expect(intentionally_empty.success && intentionally_empty.stats.output_paths == 0 &&
+             !contains_diagnostic(intentionally_empty, "empty-output") &&
+             !contains_diagnostic(intentionally_empty, "invalid-numeric-value"),
+         "strict mode accepts valid intentionally empty geometry without empty-output");
+
   const auto dashed = squisher.convert_string(root(
       "<path d=\"M0 10H100\" fill=\"none\" stroke=\"black\" "
       "stroke-dasharray=\"4 4\" stroke-dashoffset=\"2\"/>"), strict);
@@ -497,12 +868,54 @@ void test_strict_capability_coverage() {
   const std::string inline_css_source =
       root("<rect width=\"10\" height=\"10\" style=\"fill:red;filter:url(#f)\"/>");
   const auto inline_css = squisher.convert_string(inline_css_source);
-  expect(inline_css.success && contains_diagnostic(inline_css, "unsupported-css-property"),
+  expect(inline_css.success && contains_diagnostic(inline_css, "unsupported-css-property") &&
+             diagnostic_message_contains(
+                 inline_css, "unsupported-css-property", "Compatible conversion ignores"),
          "compatible mode diagnoses unsupported inline CSS declarations");
   const auto strict_inline_css = squisher.convert_string(inline_css_source, strict);
   expect(!strict_inline_css.success &&
              strict_inline_css.error.find("unsupported-css-property") != std::string::npos,
          "strict mode rejects unsupported inline CSS declarations");
+
+  const auto unsupported_selector = squisher.convert_string(root(
+      "<style>g > rect{fill:red}</style><g><rect width=\"10\" height=\"10\"/></g>"));
+  expect(unsupported_selector.success &&
+             diagnostic_message_contains(
+                 unsupported_selector, "unsupported-css-selector", "g > rect") &&
+             diagnostic_message_contains(
+                 unsupported_selector, "unsupported-css-selector", "is ignored"),
+         "unsupported selector diagnostics identify the selector and ignored rule");
+
+  const auto text_path_fallback = squisher.convert_string(root(
+      "<defs><path id=\"baseline\" d=\"M0 20H100\"/></defs>"
+      "<text><textPath href=\"#baseline\">text</textPath></text>"));
+  expect(text_path_fallback.success &&
+             diagnostic_message_contains(
+                 text_path_fallback, "unsupported-text-path", "normal-cursor text layout"),
+         "textPath diagnostics state the compatible normal-cursor layout");
+
+  const auto switch_fallback = squisher.convert_string(root(
+      "<switch><rect width=\"10\" height=\"10\"/>"
+      "<circle cx=\"20\" cy=\"20\" r=\"5\"/></switch>"));
+  expect(switch_fallback.success &&
+             diagnostic_message_contains(
+                 switch_fallback, "unsupported-switch", "traverses all branches"),
+         "switch diagnostics state that compatible conversion traverses every branch");
+
+  const auto nested_viewport_fallback = squisher.convert_string(root(
+      "<svg x=\"10\" y=\"20\" width=\"50\" height=\"50\" viewBox=\"0 0 10 10\" "
+      "preserveAspectRatio=\"xMidYMid meet\" transform=\"translate(2 3)\">"
+      "<rect width=\"10\" height=\"10\"/></svg>"));
+  expect(nested_viewport_fallback.success &&
+             diagnostic_message_contains(
+                 nested_viewport_fallback,
+                 "unsupported-nested-viewport",
+                 "ignores x, y, width, height, viewBox, and preserveAspectRatio") &&
+             diagnostic_message_contains(
+                 nested_viewport_fallback,
+                 "unsupported-nested-viewport",
+                 "current user coordinate system with any transform still applied"),
+         "nested viewport diagnostics state the deterministic compatible fallback");
 
   const std::string external_paint_source = root(
       "<rect width=\"10\" height=\"10\" "
@@ -510,12 +923,51 @@ void test_strict_capability_coverage() {
   const auto compatible_external_paint = squisher.convert_string(external_paint_source);
   expect(compatible_external_paint.success &&
              contains_diagnostic(compatible_external_paint, "unsupported-external-reference") &&
+             diagnostic_message_contains(
+                 compatible_external_paint,
+                 "unsupported-external-reference",
+                 "replaces this paint with none") &&
              compatible_external_paint.svg.find("evil.invalid") == std::string::npos,
          "compatible mode diagnoses and removes external presentation-attribute paints");
   const auto strict_external_paint = squisher.convert_string(external_paint_source, strict);
   expect(!strict_external_paint.success &&
              strict_external_paint.error.find("unsupported-external-reference") != std::string::npos,
          "strict mode rejects external presentation-attribute paints");
+
+  const std::string escaped_external_paint_source = root(R"SVG(
+    <rect width="10" height="10"
+      fill="\75\72\6c(http://127.0.0.1:47931/leak.svg)"/>
+  )SVG");
+  const auto compatible_escaped_external =
+    squisher.convert_string(escaped_external_paint_source);
+  const auto strict_escaped_external =
+    squisher.convert_string(escaped_external_paint_source, strict);
+  expect(compatible_escaped_external.success &&
+             contains_diagnostic(
+               compatible_escaped_external, "unsupported-external-reference") &&
+             compatible_escaped_external.svg.find("127.0.0.1") ==
+               std::string::npos &&
+             compatible_escaped_external.svg.find("fill=\"none\"") !=
+               std::string::npos,
+         "compatible output removes an external URL with an escaped CSS function name");
+  expect(!strict_escaped_external.success &&
+             strict_escaped_external.svg.empty() &&
+             strict_escaped_external.error.find("unsupported-external-reference") !=
+               std::string::npos,
+         "strict mode rejects an external URL with an escaped CSS function name");
+
+  const std::string escaped_local_paint_source = root(R"SVG(
+    <defs><linearGradient id="safe-local"><stop offset="0" stop-color="red"/>
+      <stop offset="1" stop-color="blue"/></linearGradient></defs>
+    <rect width="10" height="10" fill="\75\72\6c(\23 safe-local)"/>
+  )SVG");
+  const auto escaped_local_paint =
+    squisher.convert_string(escaped_local_paint_source, strict);
+  expect(escaped_local_paint.success && escaped_local_paint.diagnostics.empty() &&
+             escaped_local_paint.svg.find("id=\"safe-local\"") !=
+               std::string::npos &&
+             escaped_local_paint.svg.find("safe-local") != std::string::npos,
+         "escaped local-fragment paint URLs remain supported and retain their definition");
 
   const std::string external_inline_paint_source = root(
       "<path d=\"M0 0H10\" style=\"fill:none;stroke:url('https://evil.invalid/stroke.svg#s')\"/>");
@@ -525,6 +977,22 @@ void test_strict_capability_coverage() {
              strict_external_inline.error.find("unsupported-external-reference") !=
                  std::string::npos,
          "strict mode rejects external URLs in inline CSS paints");
+
+  const std::string escaped_inline_paint_source = root(R"SVG(
+    <path d="M0 0H10V10Z"
+      style="fill:\55\52\4c ( 'https://evil.invalid/escaped.svg' )"/>
+  )SVG");
+  const auto compatible_escaped_inline =
+    squisher.convert_string(escaped_inline_paint_source);
+  const auto strict_escaped_inline =
+    squisher.convert_string(escaped_inline_paint_source, strict);
+  expect(compatible_escaped_inline.success &&
+             contains_diagnostic(
+               compatible_escaped_inline, "unsupported-external-reference") &&
+             compatible_escaped_inline.svg.find("evil.invalid") ==
+               std::string::npos &&
+             !strict_escaped_inline.success,
+         "escaped mixed-case URL functions in inline CSS are diagnosed and removed");
 
   const auto unreferenced_script = squisher.convert_string(
       root("<defs><script>console.log('active')</script></defs>"
@@ -546,6 +1014,8 @@ void test_strict_capability_coverage() {
          root("<path d=\"M0 0H10\" fill=\"none\" stroke=\"black\" stroke-width=\"-4\"/>"),
          root("<rect width=\"10\" height=\"10\" transform=\"scale(1e999)\"/>"),
          "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 inf 10\">"
+         "<rect width=\"10\" height=\"10\"/></svg>",
+         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0. 0 10 10\">"
          "<rect width=\"10\" height=\"10\"/></svg>"}) {
     const auto rejected_numeric = squisher.convert_string(invalid_numeric, strict);
     expect(!rejected_numeric.success && rejected_numeric.svg.empty() &&
@@ -553,12 +1023,111 @@ void test_strict_capability_coverage() {
            "strict mode rejects malformed, non-finite, and out-of-range numeric values");
   }
 
+  const std::vector<std::string> malformed_comma_wsp{
+    root("<rect width=\"10\" height=\"10\" transform=\"translate(,5 6)\"/>"),
+    root("<rect width=\"10\" height=\"10\" transform=\"translate(5,,6)\"/>"),
+    root("<rect width=\"10\" height=\"10\" transform=\"translate(5 6,)\"/>"),
+    root("<rect width=\"10\" height=\"10\" transform=\",translate(5 6)\"/>"),
+    root("<rect width=\"10\" height=\"10\" transform=\"translate(5 6),,scale(2)\"/>"),
+    root("<rect width=\"10\" height=\"10\" transform=\"translate(5 6),\"/>"),
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\",0 0 10 10\">"
+      "<rect width=\"10\" height=\"10\"/></svg>",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0,,0 10 10\">"
+      "<rect width=\"10\" height=\"10\"/></svg>",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10,\">"
+      "<rect width=\"10\" height=\"10\"/></svg>",
+    root("<polyline points=\",0 0 10 10\"/>"),
+    root("<polyline points=\"0,,0 10 10\"/>"),
+    root("<polyline points=\"0 0 10 10,\"/>"),
+  };
+  for (const std::string& malformed : malformed_comma_wsp) {
+    const auto rejected = squisher.convert_string(malformed, strict);
+    expect(!rejected.success && rejected.svg.empty() &&
+               rejected.error.find("invalid-numeric-value") != std::string::npos,
+           "strict mode rejects leading, doubled, and trailing comma-wsp errors");
+  }
+
+  for (const std::string& malformed_path : {
+         std::string("M,0 0L10 10"),
+         std::string("M0,,0L10 10"),
+         std::string("M0 0L10 10,")}) {
+    const auto rejected = squisher.convert_string(
+        root("<path d=\"" + malformed_path + "\"/>"), strict);
+    expect(!rejected.success && rejected.svg.empty() &&
+               rejected.error.find("invalid-path-data") != std::string::npos,
+           "strict mode rejects malformed path comma-wsp: " + malformed_path);
+  }
+
   const auto compatible_non_finite = squisher.convert_string(
       root("<rect x=\"1e999\" width=\"10\" height=\"10\" opacity=\"nan\"/>"));
   expect(compatible_non_finite.success &&
+             diagnostic_message_contains(
+                 compatible_non_finite, "invalid-numeric-value", "substitutes 0") &&
+             diagnostic_message_contains(
+                 compatible_non_finite, "invalid-numeric-value", "default value 1") &&
              compatible_non_finite.svg.find("inf") == std::string::npos &&
              compatible_non_finite.svg.find("nan") == std::string::npos,
-         "compatible conversion never serializes non-finite generated geometry");
+         "compatible numeric diagnostics name coordinate and opacity fallbacks");
+
+  const auto relative_coordinate = squisher.convert_string(
+      root("<rect x=\"1in\" width=\"10\" height=\"10\"/>"));
+  expect(relative_coordinate.success &&
+             diagnostic_message_contains(
+                 relative_coordinate, "unsupported-length-unit", "substitutes 0") &&
+             relative_coordinate.svg.find("1in") == std::string::npos,
+         "relative geometry-coordinate diagnostics state the zero fallback");
+
+  const auto relative_extent = squisher.convert_string(
+      root("<rect width=\"1in\" height=\"10\"/>"));
+  expect(relative_extent.success &&
+             diagnostic_message_contains(
+                 relative_extent, "unsupported-length-unit", "rect geometry is dropped") &&
+             relative_extent.svg.find("<path ") == std::string::npos,
+         "relative geometry-extent diagnostics state that geometry is dropped");
+
+  const auto text_position_fallback = squisher.convert_string(root(
+      "<text x=\"12\" y=\"20\">first<tspan x=\"1in\">second</tspan></text>"));
+  expect(text_position_fallback.success &&
+             diagnostic_message_contains(
+                 text_position_fallback,
+                 "unsupported-length-unit",
+                 "keeps the current text cursor x coordinate"),
+         "unsupported text coordinate lists state that current cursor positioning is retained");
+
+  const auto css_numeric_fallback = squisher.convert_string(root(
+      "<path d=\"M0 0H10\" fill=\"none\" stroke=\"black\" "
+      "style=\"stroke-width:-4\"/>"));
+  expect(css_numeric_fallback.success &&
+             diagnostic_message_contains(
+                 css_numeric_fallback,
+                 "invalid-numeric-value",
+                 "default stroke width of 1"),
+         "invalid CSS numeric diagnostics state the substituted default");
+
+  const auto css_unit_fallback = squisher.convert_string(root(
+      "<text x=\"0\" y=\"20\" style=\"font-size:1in\">text</text>"));
+  expect(css_unit_fallback.success &&
+             diagnostic_message_contains(
+                 css_unit_fallback,
+                 "unsupported-length-unit",
+                 "default font size of 16"),
+         "unsupported CSS units state the substituted text default");
+
+  const auto current_color = squisher.convert_string(
+      root("<rect width=\"10\" height=\"10\" color=\"red\" fill=\"currentColor\"/>"));
+  expect(current_color.success &&
+             diagnostic_message_contains(
+                 current_color,
+                 "unsupported-current-color",
+                 "output renderer resolves it"),
+         "currentColor diagnostics state how compatible output handles the paint");
+
+  const auto text_layout = squisher.convert_string(
+      root("<text x=\"0\" y=\"20\" direction=\"rtl\">text</text>"));
+  expect(text_layout.success &&
+             diagnostic_message_contains(
+                 text_layout, "unsupported-text-layout", "ignores direction"),
+         "unsupported text-layout diagnostics state that the property is ignored");
 
   for (const std::string& invisible : {
          root("<rect width=\"10\" height=\"10\" display=\"none\"/>"),
@@ -617,6 +1186,55 @@ void test_safe_file_and_batch_workflow() {
   expect(batch.files.size() == 4 && batch.files[0].input_path.filename() == "a.svg",
          "batch processing order is deterministic");
 
+  const fs::path symlink_input = temporary / "symlink-input";
+  const fs::path symlink_source = temporary / "symlink-source/source.svg";
+  const fs::path symlink_output = temporary / "other-root/output";
+  const fs::path escaped_destination = temporary / "other-root/symlink-source/source.svg";
+  fs::create_directories(symlink_input);
+  write_text(symlink_source, sample);
+  write_text(escaped_destination, "sentinel");
+  std::error_code symlink_error;
+  fs::create_symlink(symlink_source, symlink_input / "linked.svg", symlink_error);
+  if (!symlink_error) {
+    const auto symlink_batch = squisher.squish_directory_with_result(
+        symlink_input, symlink_output, recursive);
+    expect(symlink_batch.converted == 0 && symlink_batch.failed == 0 &&
+               symlink_batch.skipped == 1 && symlink_batch.files.size() == 1 &&
+               symlink_batch.files.front().output_path == symlink_output / "linked.svg",
+           "directory batches report SVG symlinks as contained skipped entries");
+    expect(svg_squisher::read_file(escaped_destination) == "sentinel" &&
+               !fs::exists(symlink_output / "linked.svg"),
+           "recursive symlink inputs cannot write outside the output directory");
+  }
+
+  const fs::path linked_output_input = temporary / "linked-output-input/sub";
+  const fs::path linked_output_root = temporary / "linked-output-root";
+  const fs::path linked_output_outside = temporary / "linked-output-outside";
+  const fs::path linked_output_sentinel = linked_output_outside / "a.svg";
+  fs::create_directories(linked_output_input);
+  fs::create_directories(linked_output_root);
+  write_text(linked_output_input / "a.svg", sample);
+  write_text(linked_output_sentinel, "outside sentinel");
+  std::error_code output_link_error;
+  fs::create_directory_symlink(
+      linked_output_outside, linked_output_root / "sub", output_link_error);
+#if !defined(_WIN32)
+  expect(!output_link_error, "linked-output fixture creates a directory symlink");
+#endif
+  if (!output_link_error) {
+    const auto linked_output_batch = squisher.squish_directory_with_result(
+        temporary / "linked-output-input", linked_output_root, recursive);
+    expect(linked_output_batch.converted == 0 &&
+               linked_output_batch.failed == 1 &&
+               linked_output_batch.skipped == 0 &&
+               linked_output_batch.files.size() == 1 &&
+               linked_output_batch.files.front().error.find(
+                   "symbolic link or reparse point") != std::string::npos,
+           "recursive batches report a linked destination parent as a failure");
+    expect(svg_squisher::read_file(linked_output_sentinel) == "outside sentinel",
+           "a linked destination parent cannot overwrite a file outside the output root");
+  }
+
   fs::create_directories(temporary / "contained/generated/previous");
   write_text(temporary / "contained/source.svg", sample);
   write_text(temporary / "contained/generated/prior.svg", sample);
@@ -673,6 +1291,7 @@ void test_safe_file_and_batch_workflow() {
 int main() {
   test_exclusive_atomic_file_writes();
   test_expanded_traversal_bounds();
+  test_symbol_viewport_contract();
   test_conversion_contract();
   test_explicit_conversion_policies();
   test_preserved_document_semantics();

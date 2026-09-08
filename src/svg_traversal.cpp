@@ -11,11 +11,13 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "svg_computed_style.h"
 #include "svg_diagnostics.h"
 #include "svg_dom.h"
+#include "svg_geometry.h"
 #include "svg_path.h"
 #include "svg_shape.h"
 #include "svg_stroke.h"
@@ -27,12 +29,15 @@ namespace svg_squisher {
 namespace {
 
 struct TraversalContext {
+  const SvgIdIndex* id_index = nullptr;
   std::unordered_set<std::string> active_references;
   std::size_t reference_depth = 0;
   std::size_t expanded_nodes = 1;
   std::size_t emitted_output_paths = 0;
+  std::size_t symbol_instance_depth = 0;
   bool resource_budget_exhausted = false;
   bool font_path_is_authoritative = false;
+  ConversionPolicy conversion_policy = ConversionPolicy::PreserveAppearance;
   std::vector<std::string>* fonts_used = nullptr;
   std::vector<Diagnostic>* diagnostics = nullptr;
   std::size_t* missing_glyphs = nullptr;
@@ -61,6 +66,18 @@ void record_traversal_warning(TraversalContext& context,
     context.diagnostics->push_back(
         {DiagnosticSeverity::Warning, code, message, element});
   }
+}
+
+void record_live_stroke_retention(TraversalContext& context,
+                                  const pugi::xml_node& node,
+                                  const std::string& reason) {
+  if (context.conversion_policy != ConversionPolicy::FilledPaths) return;
+  record_traversal_warning(
+      context,
+      node,
+      "live-stroke-retained",
+      reason + " Compatible conversion retained the stroke as live SVG stroke attributes; "
+               "strict conversion rejects this fallback.");
 }
 
 bool begin_expanded_node(const pugi::xml_node& node,
@@ -313,21 +330,284 @@ std::string normalize_text_whitespace(const std::string& raw,
   return normalized;
 }
 
-void collect_normalized_text(const pugi::xml_node& node,
-                             bool inherited_preserve,
-                             TextWhitespaceState& whitespace,
-                             std::string& text) {
-  const bool preserve = preserve_whitespace_for_node(node, inherited_preserve);
+bool text_styles_match(const StyleState& lhs, const StyleState& rhs) {
+  return lhs.fill == rhs.fill &&
+         lhs.fill_opacity == rhs.fill_opacity &&
+         lhs.stroke == rhs.stroke &&
+         lhs.stroke_opacity == rhs.stroke_opacity &&
+         lhs.stroke_width == rhs.stroke_width &&
+         lhs.stroke_dasharray == rhs.stroke_dasharray &&
+         lhs.stroke_linecap == rhs.stroke_linecap &&
+         lhs.stroke_linejoin == rhs.stroke_linejoin &&
+         lhs.stroke_miterlimit == rhs.stroke_miterlimit &&
+         lhs.fill_rule == rhs.fill_rule &&
+         lhs.opacity == rhs.opacity &&
+         lhs.display == rhs.display &&
+         lhs.visibility == rhs.visibility &&
+         lhs.font_size == rhs.font_size &&
+         lhs.font_family == rhs.font_family &&
+         lhs.font_weight == rhs.font_weight &&
+         lhs.font_style == rhs.font_style &&
+         lhs.text_anchor == rhs.text_anchor &&
+         lhs.letter_spacing == rhs.letter_spacing;
+}
+
+struct CompatibleTspanText {
+  std::string text;
+  TextWhitespaceState whitespace;
+  std::size_t element_count = 0;
+  std::size_t maximum_relative_depth = 0;
+};
+
+bool has_only_shape_transparent_tspan_attributes(
+    const pugi::xml_node& node) {
+  for (const pugi::xml_attribute attribute : node.attributes()) {
+    const std::string name = attribute.name();
+    if (name != "id" && name != "class") return false;
+  }
+  return true;
+}
+
+bool collect_compatible_tspan_text(const pugi::xml_node& node,
+                                   const std::vector<CssRule>& rules,
+                                   const StyleState& inherited_style,
+                                   bool preserve,
+                                   std::size_t relative_depth,
+                                   CompatibleTspanText& result) {
+  if (std::string(node.name()) != "tspan" ||
+      !has_only_shape_transparent_tspan_attributes(node)) {
+    return false;
+  }
+
+  const StyleState style = resolve_style(node, rules, inherited_style);
+  if (!text_styles_match(style, inherited_style) ||
+      node_has_local_property(node, rules, "opacity")) {
+    return false;
+  }
+
+  const std::size_t original_text_size = result.text.size();
+  const TextWhitespaceState original_whitespace = result.whitespace;
+  const std::size_t original_element_count = result.element_count;
+  const std::size_t original_maximum_depth = result.maximum_relative_depth;
+  const auto rollback = [&]() {
+    result.text.resize(original_text_size);
+    result.whitespace = original_whitespace;
+    result.element_count = original_element_count;
+    result.maximum_relative_depth = original_maximum_depth;
+  };
+
+  ++result.element_count;
+  result.maximum_relative_depth =
+      std::max(result.maximum_relative_depth, relative_depth);
   for (const pugi::xml_node child : node.children()) {
     if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) {
-      text += normalize_text_whitespace(child.value(), preserve, whitespace);
-    } else if (child.type() == pugi::node_element) {
-      const std::string child_name = child.name();
-      if (child_name == "tspan" || child_name == "textPath") {
-        collect_normalized_text(child, preserve, whitespace, text);
-      }
+      result.text += normalize_text_whitespace(
+          child.value(), preserve, result.whitespace);
+      continue;
+    }
+    if (child.type() == pugi::node_element &&
+        collect_compatible_tspan_text(
+            child, rules, style, preserve, relative_depth + 1, result)) {
+      continue;
+    }
+    if (child.type() == pugi::node_element) {
+      rollback();
+      return false;
     }
   }
+
+  return true;
+}
+
+void append_utf8_codepoint(std::string& text, char32_t codepoint) {
+  if (codepoint <= 0x7f) {
+    text.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7ff) {
+    text.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+    text.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0xffff) {
+    text.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+    text.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    text.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else {
+    text.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+    text.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+    text.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    text.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  }
+}
+
+struct AnchorMeasureRun {
+  std::string text;
+  std::string font_path;
+  StyleState style;
+  std::string transform;
+  bool preserve_whitespace = false;
+};
+
+struct AnchorMeasurement {
+  std::vector<AnchorMeasureRun> runs;
+  bool has_character = false;
+  bool reached_next_chunk = false;
+  bool merge_barrier = false;
+};
+
+void append_anchor_measure_run(AnchorMeasurement& measurement,
+                               std::string text,
+                               const std::optional<std::string>& font_path,
+                               const StyleState& style,
+                               const std::string& transform,
+                               bool preserve_whitespace) {
+  if (text.empty()) return;
+  if (!font_path) {
+    measurement.merge_barrier = true;
+    return;
+  }
+
+  if (!measurement.merge_barrier && !measurement.runs.empty()) {
+    AnchorMeasureRun& previous = measurement.runs.back();
+    if (previous.font_path == *font_path &&
+        previous.transform == transform &&
+        previous.preserve_whitespace == preserve_whitespace &&
+        text_styles_match(previous.style, style)) {
+      previous.text += text;
+      return;
+    }
+  }
+
+  measurement.runs.push_back(
+    {std::move(text), *font_path, style, transform, preserve_whitespace});
+  measurement.merge_barrier = false;
+}
+
+void collect_anchor_measure_runs(
+    const pugi::xml_node& node,
+    const std::vector<CssRule>& rules,
+    const StyleState& style,
+    const StyleState& effective_style,
+    const std::string& transform,
+    const std::optional<std::string>& font_path,
+    const std::optional<std::string>& fallback_font_path,
+    bool font_path_is_authoritative,
+    bool preserve,
+    TextWhitespaceState& whitespace,
+    std::vector<TextPositionState*>& position_stack,
+    AnchorMeasurement& measurement) {
+  const ComputedStyle computed = compute_style(effective_style);
+  for (const pugi::xml_node child : node.children()) {
+    if (measurement.reached_next_chunk) return;
+    if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) {
+      const std::string normalized =
+        normalize_text_whitespace(child.value(), preserve, whitespace);
+      std::string included;
+      for (const char32_t codepoint : decode_utf8(normalized)) {
+        const bool has_absolute_position =
+          resolve_position_value(position_stack, TextPositionProperty::X).has_value() ||
+          resolve_position_value(position_stack, TextPositionProperty::Y).has_value();
+        if (measurement.has_character && has_absolute_position) {
+          measurement.reached_next_chunk = true;
+          break;
+        }
+        append_utf8_codepoint(included, codepoint);
+        measurement.has_character = true;
+        for (TextPositionState* position : position_stack) {
+          ++position->character_index;
+        }
+      }
+      append_anchor_measure_run(
+        measurement, std::move(included), font_path, effective_style, transform, preserve);
+      continue;
+    }
+
+    if (child.type() != pugi::node_element) continue;
+    const std::string child_name = child.name();
+    if (child_name != "tspan" && child_name != "textPath") continue;
+
+    const StyleState child_style = resolve_style(child, rules, style);
+    StyleState child_effective_style = child_style;
+    child_effective_style.opacity = format_opacity(
+      computed.opacity * parse_double_string(child_style.opacity, 1.0));
+    normalize_numeric_style(child_effective_style);
+    if (!compute_style(child_effective_style).displayed) continue;
+
+    TextPositionState child_position;
+    child_position.x = coord_values(child, "x");
+    child_position.y = coord_values(child, "y");
+    child_position.dx = coord_values(child, "dx");
+    child_position.dy = coord_values(child, "dy");
+    position_stack.push_back(&child_position);
+
+    const std::string child_transform =
+      combine_transform(transform, child.attribute("transform").as_string());
+    const bool child_preserve = preserve_whitespace_for_node(child, preserve);
+    const std::optional<std::string> child_font_path = resolve_text_font_path(
+      child_style, fallback_font_path, font_path_is_authoritative);
+    collect_anchor_measure_runs(
+      child,
+      rules,
+      child_style,
+      child_effective_style,
+      child_transform,
+      child_font_path,
+      fallback_font_path,
+      font_path_is_authoritative,
+      child_preserve,
+      whitespace,
+      position_stack,
+      measurement);
+    position_stack.pop_back();
+  }
+}
+
+double measure_anchor_chunk_advance(
+    const pugi::xml_node& node,
+    const std::vector<CssRule>& rules,
+    const StyleState& style,
+    const StyleState& effective_style,
+    const std::string& transform,
+    const std::optional<std::string>& font_path,
+    const std::optional<std::string>& fallback_font_path,
+    bool font_path_is_authoritative,
+    bool preserve,
+    const TextWhitespaceState& whitespace,
+    const std::vector<TextPositionState*>& position_stack) {
+  std::vector<TextPositionState> copied_positions;
+  copied_positions.reserve(position_stack.size());
+  for (const TextPositionState* position : position_stack) {
+    copied_positions.push_back(*position);
+  }
+  std::vector<TextPositionState*> copied_stack;
+  copied_stack.reserve(copied_positions.size());
+  for (TextPositionState& position : copied_positions) {
+    copied_stack.push_back(&position);
+  }
+
+  TextWhitespaceState copied_whitespace = whitespace;
+  AnchorMeasurement measurement;
+  collect_anchor_measure_runs(
+    node,
+    rules,
+    style,
+    effective_style,
+    transform,
+    font_path,
+    fallback_font_path,
+    font_path_is_authoritative,
+    preserve,
+    copied_whitespace,
+    copied_stack,
+    measurement);
+
+  double advance = 0.0;
+  for (const AnchorMeasureRun& run : measurement.runs) {
+    const ComputedStyle run_computed = compute_style(run.style);
+    advance += measure_text_advance(
+      run.text,
+      run_computed.font_size,
+      run.font_path,
+      run_computed.letter_spacing);
+  }
+  return advance;
 }
 
 StyleState stroke_as_fill_style(const StyleState& style) {
@@ -336,21 +616,80 @@ StyleState stroke_as_fill_style(const StyleState& style) {
   return outline_style;
 }
 
-std::optional<std::string> symbol_viewbox_transform(const pugi::xml_node& use_node,
-                                                    const pugi::xml_node& symbol_node) {
-  const std::vector<double> viewbox =
-    parse_number_list(symbol_node.attribute("viewBox").as_string());
-  if (viewbox.size() < 4) return std::string{};
+struct SymbolViewportMapping {
+  std::string transform;
+  double width = 0.0;
+  double height = 0.0;
+  bool uses_root_viewport_fallback = false;
+};
+
+std::pair<double, double> root_user_viewport_size(
+    const pugi::xml_node& svg_root) {
+  if (const auto viewbox =
+        parse_viewbox(svg_root.attribute("viewBox").as_string())) {
+    if ((*viewbox)[2] >= 0.0 && (*viewbox)[3] >= 0.0) {
+      return {(*viewbox)[2], (*viewbox)[3]};
+    }
+  }
+
+  const auto root_dimension = [&](const char* attribute,
+                                  double initial_value) {
+    double value = 0.0;
+    return svg_root.attribute(attribute) &&
+        parse_finite_length(svg_root.attribute(attribute).as_string(), value) &&
+        value >= 0.0
+      ? value
+      : initial_value;
+  };
+  return {root_dimension("width", 300.0), root_dimension("height", 150.0)};
+}
+
+std::optional<double> supported_viewport_dimension(
+    const pugi::xml_node& node,
+    const char* attribute) {
+  if (!node.attribute(attribute)) return std::nullopt;
+  double value = 0.0;
+  if (!parse_finite_length(node.attribute(attribute).as_string(), value) ||
+      value < 0.0) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<SymbolViewportMapping> symbol_viewbox_mapping(
+    const pugi::xml_node& use_node,
+    const pugi::xml_node& symbol_node,
+    const pugi::xml_node& svg_root) {
+  const auto [root_width, root_height] = root_user_viewport_size(svg_root);
+  const std::optional<double> symbol_width =
+    supported_viewport_dimension(symbol_node, "width");
+  const std::optional<double> symbol_height =
+    supported_viewport_dimension(symbol_node, "height");
+  const std::optional<double> use_width =
+    supported_viewport_dimension(use_node, "width");
+  const std::optional<double> use_height =
+    supported_viewport_dimension(use_node, "height");
+  const double viewport_width =
+    use_width.value_or(symbol_width.value_or(root_width));
+  const double viewport_height =
+    use_height.value_or(symbol_height.value_or(root_height));
+  const bool uses_root_viewport_fallback =
+    (!use_width && !symbol_width) || (!use_height && !symbol_height);
+  if (viewport_width <= 0.0 || viewport_height <= 0.0) return std::nullopt;
+
+  const auto parsed_viewbox =
+    parse_viewbox(symbol_node.attribute("viewBox").as_string());
+  if (!parsed_viewbox) {
+    return SymbolViewportMapping{
+      "", viewport_width, viewport_height, uses_root_viewport_fallback};
+  }
+  const auto& viewbox = *parsed_viewbox;
 
   const double min_x = viewbox[0];
   const double min_y = viewbox[1];
   const double viewbox_width = viewbox[2];
   const double viewbox_height = viewbox[3];
   if (viewbox_width <= 0.0 || viewbox_height <= 0.0) return std::nullopt;
-
-  double viewport_width = attr_double(use_node, "width", viewbox_width);
-  double viewport_height = attr_double(use_node, "height", viewbox_height);
-  if (viewport_width <= 0.0 || viewport_height <= 0.0) return std::nullopt;
 
   std::string align = "xmidymid";
   std::string meet_or_slice = "meet";
@@ -381,9 +720,70 @@ std::optional<std::string> symbol_viewbox_transform(const pugi::xml_node& use_no
     else if (align.find("ymax") != std::string::npos) offset_y = remaining_y;
   }
 
-  return "translate(" + fmt(offset_x) + " " + fmt(offset_y) + ") scale(" +
-    fmt(scale_x) + " " + fmt(scale_y) + ") translate(" + fmt(-min_x) + " " +
-    fmt(-min_y) + ")";
+  return SymbolViewportMapping{
+    "translate(" + fmt(offset_x) + " " + fmt(offset_y) + ") scale(" +
+      fmt(scale_x) + " " + fmt(scale_y) + ") translate(" + fmt(-min_x) + " " +
+      fmt(-min_y) + ")",
+    viewport_width,
+    viewport_height,
+    uses_root_viewport_fallback};
+}
+
+std::optional<BBox> transformed_bbox(const BBox& source,
+                                     const Matrix& transform) {
+  BBox result{
+    std::numeric_limits<double>::infinity(),
+    std::numeric_limits<double>::infinity(),
+    -std::numeric_limits<double>::infinity(),
+    -std::numeric_limits<double>::infinity(),
+  };
+  for (const Point point : {
+         Point{source.min_x, source.min_y},
+         Point{source.max_x, source.min_y},
+         Point{source.max_x, source.max_y},
+         Point{source.min_x, source.max_y}}) {
+    bbox_add_point(result, apply_matrix(transform, point));
+  }
+  return bbox_valid(result) ? std::optional<BBox>(result) : std::nullopt;
+}
+
+enum class SymbolClipProof {
+  Contained,
+  Outside,
+  Unprovable,
+};
+
+SymbolClipProof prove_symbol_paths_inside_viewport(
+    const std::vector<PathEntry>& paths,
+    std::size_t first_path,
+    const std::string& use_transform,
+    const SymbolViewportMapping& viewport) {
+  if (first_path >= paths.size()) return SymbolClipProof::Contained;
+  if (!transform_is_valid(use_transform)) return SymbolClipProof::Unprovable;
+  const Matrix clip_transform = parse_transform(use_transform);
+  if (!matrix_is_scale_translate_only(clip_transform)) {
+    return SymbolClipProof::Unprovable;
+  }
+
+  const BBox local_viewport{0.0, 0.0, viewport.width, viewport.height};
+  const std::optional<BBox> clip_bounds =
+    transformed_bbox(local_viewport, clip_transform);
+  if (!clip_bounds) return SymbolClipProof::Unprovable;
+
+  for (std::size_t index = first_path; index < paths.size(); ++index) {
+    const PathEntry& path = paths[index];
+    if (path.emit_stroke) return SymbolClipProof::Unprovable;
+    const std::optional<BBox> local_bounds = path_bbox(path.d);
+    if (!local_bounds || !transform_is_valid(path.transform)) {
+      return SymbolClipProof::Unprovable;
+    }
+    const std::optional<BBox> output_bounds =
+      transformed_bbox(*local_bounds, parse_transform(path.transform));
+    if (!bbox_contains(clip_bounds, output_bounds, 1e-9)) {
+      return SymbolClipProof::Outside;
+    }
+  }
+  return SymbolClipProof::Contained;
 }
 
 std::size_t collect_text_node(const pugi::xml_node& node,
@@ -430,92 +830,181 @@ std::size_t collect_text_node(const pugi::xml_node& node,
     cursor.has_y = true;
   }
 
-  const std::optional<std::string> text_font_path = resolve_text_font_path(
+  const TextFontResolution font_resolution = resolve_text_font(
     style, fallback_font_path, context.font_path_is_authoritative);
+  const std::optional<std::string>& text_font_path = font_resolution.path;
+  const bool report_family_resolution =
+    std::string(node.name()) == "text" ||
+    node_has_local_property(node, rules, "font-family");
+  if (report_family_resolution && font_resolution.requested_family_unresolved) {
+    const std::string requested_family = trim(style.font_family);
+    if (font_resolution.used_fallback && text_font_path) {
+      record_traversal_warning(
+        context,
+        node,
+        "font-family-substituted",
+        "Requested font-family '" + requested_family +
+          "' could not be resolved; compatible conversion used fallback font '" +
+          *text_font_path + "'. Pass --font to select an authoritative font.");
+    } else {
+      record_traversal_warning(
+        context,
+        node,
+        "font-family-unresolved",
+        "Requested font-family '" + requested_family +
+          "' could not be resolved and no fallback font is available; compatible "
+          "conversion skipped this text. Provide --font with a readable font file.");
+    }
+  }
 
-  const bool establishes_anchor_chunk =
-    std::string(node.name()) == "text" || !position_state.x.empty();
-  if (establishes_anchor_chunk && text_font_path.has_value() &&
-      (computed.text_anchor == TextAnchorMode::Middle || computed.text_anchor == TextAnchorMode::End)) {
-    TextWhitespaceState measure_whitespace;
-    std::string chunk_text;
-    collect_normalized_text(node, preserve, measure_whitespace, chunk_text);
-    const double advance = measure_text_advance(
-      chunk_text, computed.font_size, *text_font_path, computed.letter_spacing);
+  const bool establishes_anchor_chunk = std::string(node.name()) == "text" ||
+    !position_state.x.empty() || !position_state.y.empty();
+  if (establishes_anchor_chunk &&
+      (computed.text_anchor == TextAnchorMode::Middle ||
+       computed.text_anchor == TextAnchorMode::End)) {
+    const double advance = measure_anchor_chunk_advance(
+      node,
+      rules,
+      style,
+      effective_style,
+      transform,
+      text_font_path,
+      fallback_font_path,
+      context.font_path_is_authoritative,
+      preserve,
+      whitespace,
+      position_stack);
     cursor.x = (position_state.x.empty() ? cursor.x : position_state.x.front()) -
       (computed.text_anchor == TextAnchorMode::Middle ? advance / 2.0 : advance);
     if (!position_state.x.empty()) position_state.first_x_override = cursor.x;
   }
 
   std::size_t total_characters = 0;
-
-  for (const pugi::xml_node child : node.children()) {
-    if (context.resource_budget_exhausted) break;
-    if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) {
-      const std::string text = normalize_text_whitespace(child.value(), preserve, whitespace);
-      const std::size_t character_count = decode_utf8(text).size();
-      const TextPositionRun positions =
-        consume_text_positions(position_stack, character_count);
-      if (!text.empty() && text_font_path.has_value()) {
-        record_font(context, *text_font_path);
-        const TextLayoutResult text_layout = text_to_path(
-          text,
-          cursor.x,
-          cursor.y,
-          computed.font_size,
-          *text_font_path,
-          computed.letter_spacing,
-          positions.x,
-          positions.y,
-          positions.dx,
-          positions.dy);
-        record_missing_glyphs(
-          context, node, *text_font_path, text_layout.missing_codepoints);
-        const std::size_t emitted_text_paths =
-            (computed.has_fill ? 1U : 0U) + (computed.has_stroke ? 1U : 0U);
-        if (computed.visible && !text_layout.d.empty() && emitted_text_paths != 0 &&
-            reserve_output_paths(node, emitted_text_paths, context)) {
-          const std::size_t first_entry = out_paths.size();
-          append_path_entry(
-            out_paths,
-            text_layout.d,
-            transform,
-            effective_style.fill,
-            effective_style.stroke,
-            effective_style,
-            computed.has_fill,
-            computed.has_stroke);
-          preserve_source_element_opacity(
-            out_paths, first_entry, computed.opacity, context);
+  const auto emit_text_run = [&](const std::string& text) {
+    const std::size_t character_count = decode_utf8(text).size();
+    const TextPositionRun positions =
+      consume_text_positions(position_stack, character_count);
+    if (!text.empty() && text_font_path.has_value()) {
+      record_font(context, *text_font_path);
+      const TextLayoutResult text_layout = text_to_path(
+        text,
+        cursor.x,
+        cursor.y,
+        computed.font_size,
+        *text_font_path,
+        computed.letter_spacing,
+        positions.x,
+        positions.y,
+        positions.dx,
+        positions.dy);
+      record_missing_glyphs(
+        context, node, *text_font_path, text_layout.missing_codepoints);
+      const std::size_t emitted_text_paths =
+          (computed.has_fill ? 1U : 0U) + (computed.has_stroke ? 1U : 0U);
+      if (computed.visible && !text_layout.d.empty() && emitted_text_paths != 0 &&
+          reserve_output_paths(node, emitted_text_paths, context)) {
+        if (computed.has_stroke) {
+          record_live_stroke_retention(
+              context,
+              node,
+              "Filled-path conversion does not outline strokes applied to converted text geometry.");
         }
-        cursor.x = text_layout.end_x;
-        cursor.y = text_layout.end_y;
+        const std::size_t first_entry = out_paths.size();
+        append_path_entry(
+          out_paths,
+          text_layout.d,
+          transform,
+          effective_style.fill,
+          effective_style.stroke,
+          effective_style,
+          computed.has_fill,
+          computed.has_stroke);
+        preserve_source_element_opacity(
+          out_paths, first_entry, computed.opacity, context);
       }
-      total_characters += character_count;
-      continue;
+      cursor.x = text_layout.end_x;
+      cursor.y = text_layout.end_y;
+    }
+    total_characters += character_count;
+  };
+
+  for (pugi::xml_node child = node.first_child(); child;) {
+    if (context.resource_budget_exhausted) break;
+
+    if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata ||
+        (child.type() == pugi::node_element &&
+         std::string(child.name()) == "tspan")) {
+      CompatibleTspanText run;
+      run.whitespace = whitespace;
+      bool included_content = false;
+      pugi::xml_node next = child;
+      while (next) {
+        if (next.type() == pugi::node_pcdata || next.type() == pugi::node_cdata) {
+          run.text += normalize_text_whitespace(
+              next.value(), preserve, run.whitespace);
+          included_content = true;
+          next = next.next_sibling();
+          continue;
+        }
+        if (next.type() != pugi::node_element) {
+          next = next.next_sibling();
+          continue;
+        }
+        if (std::string(next.name()) != "tspan") break;
+
+        const std::size_t original_text_size = run.text.size();
+        const TextWhitespaceState original_whitespace = run.whitespace;
+        const std::size_t original_element_count = run.element_count;
+        const std::size_t original_maximum_depth = run.maximum_relative_depth;
+        if (!collect_compatible_tspan_text(
+              next, rules, style, preserve, 1, run) ||
+            run.element_count >
+              kMaxExpandedNodeCount - context.expanded_nodes ||
+            expanded_depth + run.maximum_relative_depth >
+              kMaxExpandedTraversalDepth) {
+          run.text.resize(original_text_size);
+          run.whitespace = original_whitespace;
+          run.element_count = original_element_count;
+          run.maximum_relative_depth = original_maximum_depth;
+          break;
+        }
+        included_content = true;
+        next = next.next_sibling();
+      }
+
+      if (included_content) {
+        context.expanded_nodes += run.element_count;
+        whitespace = run.whitespace;
+        emit_text_run(run.text);
+        child = next;
+        continue;
+      }
     }
 
-    if (child.type() != pugi::node_element) continue;
-    const std::string child_name = child.name();
-    if (child_name != "tspan" && child_name != "textPath") continue;
-    if (!begin_expanded_node(child, expanded_depth + 1, context)) continue;
-
-    const std::size_t child_characters = collect_text_node(
-      child,
-      svg_root,
-      rules,
-      style,
-      transform,
-      fallback_font_path,
-      out_paths,
-      cursor,
-      whitespace,
-      position_stack,
-      preserve,
-      parse_double_string(effective_style.opacity, 1.0),
-      expanded_depth + 1,
-      context);
-    total_characters += child_characters;
+    const pugi::xml_node next = child.next_sibling();
+    if (child.type() == pugi::node_element) {
+      const std::string child_name = child.name();
+      if ((child_name == "tspan" || child_name == "textPath") &&
+          begin_expanded_node(child, expanded_depth + 1, context)) {
+        const std::size_t child_characters = collect_text_node(
+          child,
+          svg_root,
+          rules,
+          style,
+          transform,
+          fallback_font_path,
+          out_paths,
+          cursor,
+          whitespace,
+          position_stack,
+          preserve,
+          parse_double_string(effective_style.opacity, 1.0),
+          expanded_depth + 1,
+          context);
+        total_characters += child_characters;
+      }
+    }
+    child = next;
   }
 
   position_stack.pop_back();
@@ -569,7 +1058,7 @@ void collect_paths(const pugi::xml_node& node,
             "A cyclic use reference was suppressed to keep conversion bounded.");
         return;
       }
-      const auto target = find_by_id(svg_root, reference_id);
+      const auto target = find_by_id(*context.id_index, reference_id);
       if (target) {
         std::string use_transform = transform;
         const double x = attr_double(node, "x", 0.0);
@@ -587,19 +1076,38 @@ void collect_paths(const pugi::xml_node& node,
             context.active_references.erase(reference_id);
             return;
           }
-          const StyleState symbol_style = resolve_style(*target, rules, style);
-          const ComputedStyle symbol_computed = compute_style(symbol_style);
+          StyleState symbol_style = resolve_style(*target, rules, style);
+          // A symbol's generated instance has an author-agent display value of
+          // inline even when display on the definition itself says otherwise.
+          symbol_style.display = "inline";
+          if (target->attribute("x") || target->attribute("y")) {
+            record_traversal_warning(
+              context,
+              node,
+              "unsupported-symbol-position",
+              "The referenced symbol sets x or y, whose instance-position semantics are outside the supported symbol contract. Compatible conversion ignores the symbol position and applies only x/y from this use; strict conversion rejects this use instance.");
+          }
           const double symbol_opacity = std::clamp(
             parse_double_string(effective_style.opacity, 1.0) *
               parse_double_string(symbol_style.opacity, 1.0),
             0.0,
             1.0);
-          const std::optional<std::string> viewport_transform =
-            symbol_viewbox_transform(node, *target);
-          if (symbol_computed.displayed && viewport_transform.has_value()) {
+          const std::optional<SymbolViewportMapping> viewport =
+            symbol_viewbox_mapping(node, *target, svg_root);
+          if (viewport.has_value()) {
+            if (viewport->uses_root_viewport_fallback &&
+                context.symbol_instance_depth > 0) {
+              record_traversal_warning(
+                context,
+                node,
+                "unsupported-nested-symbol-viewport",
+                "A nested symbol use relies on an automatic width or height from its containing symbol viewport. Compatible conversion resolves that automatic dimension against the root SVG viewport because nested viewport state is outside the supported contract; strict conversion rejects this use instance. Set explicit width and height on the use or referenced symbol for deterministic conversion.");
+            }
+            const std::size_t first_symbol_path = out_paths.size();
             std::string symbol_transform = combine_transform(
               use_transform, target->attribute("transform").as_string());
-            symbol_transform = combine_transform(symbol_transform, *viewport_transform);
+            symbol_transform = combine_transform(symbol_transform, viewport->transform);
+            ++context.symbol_instance_depth;
             for (const pugi::xml_node child : target->children()) {
               collect_paths(
                 child,
@@ -613,6 +1121,27 @@ void collect_paths(const pugi::xml_node& node,
                 expanded_depth + 2,
                 context);
               if (context.resource_budget_exhausted) break;
+            }
+            --context.symbol_instance_depth;
+
+            const bool overflow_is_visible =
+              lower_copy(trim(target->attribute("overflow").as_string())) == "visible";
+            if (!overflow_is_visible) {
+              const SymbolClipProof clip_proof = prove_symbol_paths_inside_viewport(
+                out_paths,
+                first_symbol_path,
+                combine_transform(
+                  use_transform, target->attribute("transform").as_string()),
+                *viewport);
+              if (clip_proof != SymbolClipProof::Contained) {
+                record_traversal_warning(
+                  context,
+                  node,
+                  "unsupported-symbol-viewport-clipping",
+                  clip_proof == SymbolClipProof::Outside
+                    ? "Referenced symbol geometry extends outside its use viewport. Compatible conversion expands the symbol without the required viewport clip, so overflow remains visible; strict conversion rejects this use instance. Set overflow=\"visible\" only when unclipped overflow is intended."
+                    : "Referenced symbol geometry could not be proven to remain inside its use viewport. Compatible conversion expands the symbol without a viewport clip, so overflow may remain visible; strict conversion rejects this use instance. Set overflow=\"visible\" only when unclipped overflow is intended.");
+              }
             }
           }
         } else {
@@ -661,10 +1190,13 @@ void collect_paths(const pugi::xml_node& node,
   const std::size_t first_source_entry = out_paths.size();
   if ((name == "circle" || name == "ellipse") &&
       emit_stroke_for_node && computed.stroke_width > 0.0 && !computed.has_dash_pattern) {
-    if (emit_fill_for_node && reserve_output_paths(node, 1, context)) {
+    const std::string fill_path =
+        name == "circle" ? circle_to_path(node) : ellipse_to_path(node);
+    if (emit_fill_for_node && !fill_path.empty() &&
+        reserve_output_paths(node, 1, context)) {
       append_path_entry(
         out_paths,
-        name == "circle" ? circle_to_path(node) : ellipse_to_path(node),
+        fill_path,
         transform,
         effective_style.fill,
         effective_style.stroke,
@@ -674,11 +1206,13 @@ void collect_paths(const pugi::xml_node& node,
     }
 
     const StyleState outline_style = stroke_as_fill_style(effective_style);
-    if (reserve_output_paths(node, 1, context)) {
+    const std::string stroke_path =
+        name == "circle" ? circle_stroke_to_ring(node, computed.stroke_width)
+                         : ellipse_stroke_to_ring(node, computed.stroke_width);
+    if (!stroke_path.empty() && reserve_output_paths(node, 1, context)) {
       append_path_entry(
         out_paths,
-        name == "circle" ? circle_stroke_to_ring(node, computed.stroke_width)
-                         : ellipse_stroke_to_ring(node, computed.stroke_width),
+        stroke_path,
         transform,
         effective_style.stroke,
         effective_style.stroke,
@@ -714,11 +1248,21 @@ void collect_paths(const pugi::xml_node& node,
                   computed.stroke_miterlimit))
           : "";
 
-      const bool emit_live_stroke = final_stroke_outline.empty() && emit_stroke;
+      const bool emit_live_stroke =
+          final_stroke_outline.empty() && emit_stroke && computed.stroke_width > 0.0 &&
+          stroke_path_can_paint(d, to_string(computed.stroke_linecap));
       const std::size_t emitted_live_paths =
           (emit_fill ? 1U : 0U) + (emit_live_stroke ? 1U : 0U);
       if (emitted_live_paths != 0 &&
           reserve_output_paths(node, emitted_live_paths, context)) {
+        if (emit_live_stroke) {
+          record_live_stroke_retention(
+              context,
+              node,
+              keep_live_dashed_stroke
+                  ? "Filled-path conversion cannot yet outline dashed strokes."
+                  : "Filled-path conversion could not produce a valid outline for this stroke.");
+        }
         append_path_entry(
           out_paths,
           d,
@@ -766,6 +1310,7 @@ void collect_paths(const pugi::xml_node& node,
 }  // namespace
 
 void collect_paths_from_svg(const pugi::xml_node& svg_node,
+                            const SvgIdIndex& id_index,
                             const std::vector<CssRule>& rules,
                             const StyleState& root_style,
                             const std::optional<std::string>& font_path,
@@ -773,11 +1318,14 @@ void collect_paths_from_svg(const pugi::xml_node& svg_node,
                             bool font_path_is_authoritative,
                             std::vector<std::string>* fonts_used,
                             std::vector<Diagnostic>* diagnostics,
-                            std::size_t* missing_glyphs) {
+                            std::size_t* missing_glyphs,
+                            ConversionPolicy conversion_policy) {
   if (!compute_style(root_style).displayed) return;
 
   TraversalContext context;
+  context.id_index = &id_index;
   context.font_path_is_authoritative = font_path_is_authoritative;
+  context.conversion_policy = conversion_policy;
   context.fonts_used = fonts_used;
   context.diagnostics = diagnostics;
   context.missing_glyphs = missing_glyphs;

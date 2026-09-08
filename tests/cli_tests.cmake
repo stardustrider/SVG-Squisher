@@ -141,4 +141,126 @@ if(operand_result EQUAL 0)
   message(FATAL_ERROR "Extra positional operand was accepted")
 endif()
 
+file(WRITE "${test_root}/dashed.svg"
+  "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\"><path d=\"M1 10H19\" fill=\"none\" stroke=\"black\" stroke-width=\"2\" stroke-dasharray=\"2 2\"/></svg>")
+execute_process(
+  COMMAND "${SVG_SQUISHER_EXE}" dashed.svg filled-compatible.svg
+    --conversion-policy filled-paths --report policy-report.json
+  WORKING_DIRECTORY "${test_root}"
+  RESULT_VARIABLE filled_compatible_result
+  OUTPUT_QUIET
+  ERROR_VARIABLE filled_compatible_error
+  TIMEOUT 10
+)
+if(NOT filled_compatible_result EQUAL 0 OR
+   NOT filled_compatible_error MATCHES "live-stroke-retained")
+  message(FATAL_ERROR
+    "Compatible filled-path policy did not report its live-stroke fallback: ${filled_compatible_error}")
+endif()
+file(READ "${test_root}/policy-report.json" policy_report)
+if(NOT policy_report MATCHES "\"conversionPolicy\":\"filled-paths\"")
+  message(FATAL_ERROR "Report omitted the selected conversion policy: ${policy_report}")
+endif()
+
+execute_process(
+  COMMAND "${SVG_SQUISHER_EXE}" dashed.svg filled-strict.svg
+    --conversion-policy filled-paths --strict
+  WORKING_DIRECTORY "${test_root}"
+  RESULT_VARIABLE filled_strict_result
+  OUTPUT_QUIET
+  ERROR_VARIABLE filled_strict_error
+  TIMEOUT 10
+)
+if(filled_strict_result EQUAL 0 OR EXISTS "${test_root}/filled-strict.svg" OR
+   NOT filled_strict_error MATCHES "live-stroke-retained")
+  message(FATAL_ERROR
+    "Strict filled-path policy did not reject the live-stroke fallback: ${filled_strict_error}")
+endif()
+
+execute_process(
+  COMMAND "${SVG_SQUISHER_EXE}" input.svg invalid-policy.svg
+    --conversion-policy unsupported
+  WORKING_DIRECTORY "${test_root}"
+  RESULT_VARIABLE invalid_policy_result
+  OUTPUT_QUIET
+  ERROR_VARIABLE invalid_policy_error
+  TIMEOUT 10
+)
+if(invalid_policy_result EQUAL 0 OR
+   NOT invalid_policy_error MATCHES "preserve-appearance or filled-paths")
+  message(FATAL_ERROR "Invalid conversion policy was not rejected clearly")
+endif()
+
+file(WRITE "${test_root}/malformed-list.svg"
+  "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\"><rect width=\"10\" height=\"10\" transform=\",translate(5,,6),,\"/></svg>")
+execute_process(
+  COMMAND "${SVG_SQUISHER_EXE}" malformed-list.svg malformed-list-output.svg --strict
+  WORKING_DIRECTORY "${test_root}"
+  RESULT_VARIABLE malformed_list_result
+  OUTPUT_QUIET
+  ERROR_VARIABLE malformed_list_error
+  TIMEOUT 10
+)
+if(malformed_list_result EQUAL 0 OR EXISTS "${test_root}/malformed-list-output.svg" OR
+   NOT malformed_list_error MATCHES "invalid-numeric-value")
+  message(FATAL_ERROR
+    "Strict conversion accepted malformed transform comma-wsp: ${malformed_list_error}")
+endif()
+
+file(WRITE "${test_root}/malformed-path.svg"
+  "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\"><path d=\"M,0,,0,L10 10,\"/></svg>")
+execute_process(
+  COMMAND "${SVG_SQUISHER_EXE}" malformed-path.svg malformed-path-output.svg --strict
+  WORKING_DIRECTORY "${test_root}"
+  RESULT_VARIABLE malformed_path_result
+  OUTPUT_QUIET
+  ERROR_VARIABLE malformed_path_error
+  TIMEOUT 10
+)
+if(malformed_path_result EQUAL 0 OR EXISTS "${test_root}/malformed-path-output.svg" OR
+   NOT malformed_path_error MATCHES "invalid-path-data")
+  message(FATAL_ERROR
+    "Strict conversion accepted malformed path comma-wsp: ${malformed_path_error}")
+endif()
+
+file(MAKE_DIRECTORY
+  "${test_root}/linked-output-input/sub"
+  "${test_root}/linked-output-root"
+  "${test_root}/linked-output-outside")
+file(WRITE "${test_root}/linked-output-input/sub/a.svg" "${original_input}")
+file(WRITE "${test_root}/linked-output-outside/a.svg" "outside sentinel")
+file(CREATE_LINK
+  "${test_root}/linked-output-outside"
+  "${test_root}/linked-output-root/sub"
+  SYMBOLIC
+  RESULT linked_output_result)
+if(linked_output_result STREQUAL "0")
+  execute_process(
+    COMMAND "${SVG_SQUISHER_EXE}"
+      "${test_root}/linked-output-input"
+      "${test_root}/linked-output-root"
+      --recursive
+      --report "${test_root}/linked-output-report.json"
+    RESULT_VARIABLE linked_output_cli_result
+    OUTPUT_VARIABLE linked_output_cli_stdout
+    ERROR_VARIABLE linked_output_cli_stderr
+    TIMEOUT 10
+  )
+  if(linked_output_cli_result EQUAL 0 OR
+     NOT linked_output_cli_stderr MATCHES "symbolic link or reparse point")
+    message(FATAL_ERROR
+      "Recursive CLI did not reject a linked output parent: ${linked_output_cli_stderr}")
+  endif()
+  file(READ "${test_root}/linked-output-outside/a.svg" linked_output_sentinel)
+  if(NOT linked_output_sentinel STREQUAL "outside sentinel")
+    message(FATAL_ERROR "Recursive CLI overwrote the outside sentinel")
+  endif()
+  file(READ "${test_root}/linked-output-report.json" linked_output_report)
+  if(NOT linked_output_report MATCHES "\"status\":\"failed\"" OR
+     NOT linked_output_report MATCHES "symbolic link or reparse point")
+    message(FATAL_ERROR
+      "Recursive CLI report omitted the linked-parent failure: ${linked_output_report}")
+  endif()
+endif()
+
 file(REMOVE_RECURSE "${test_root}")

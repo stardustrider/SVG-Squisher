@@ -13,10 +13,13 @@
 
 #include "svg_computed_style.h"
 #include "svg_diagnostics.h"
+#include "svg_dom.h"
 #include "svg_font_identity.h"
 #include "svg_output.h"
 #include "svg_postprocess.h"
 #include "svg_path.h"
+#include "svg_shape.h"
+#include "svg_stroke.h"
 #include "svg_style.h"
 #include "svg_text.h"
 #include "svg_traversal.h"
@@ -44,6 +47,30 @@ std::string strict_error(const std::vector<Diagnostic>& diagnostics) {
   return "Strict conversion rejected unsupported SVG content";
 }
 
+bool has_non_whitespace_text(const pugi::xml_node& node) {
+  for (const pugi::xml_node child : node.children()) {
+    if ((child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) &&
+        !trim(child.value()).empty()) {
+      return true;
+    }
+    if (child.type() == pugi::node_element && has_non_whitespace_text(child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool has_candidate_geometry(const pugi::xml_node& node) {
+  const std::string name = node.name();
+  if (name == "text") return has_non_whitespace_text(node);
+  if (name == "path" || name == "rect" || name == "circle" ||
+      name == "ellipse" || name == "line" || name == "polyline" ||
+      name == "polygon") {
+    return !node_to_path(node).empty();
+  }
+  return false;
+}
+
 bool has_visible_painted_input(const pugi::xml_node& node,
                                const std::vector<CssRule>& rules,
                                const StyleState& inherited) {
@@ -57,13 +84,18 @@ bool has_visible_painted_input(const pugi::xml_node& node,
   const ComputedStyle computed = compute_style(style);
   if (!computed.displayed) return false;
 
-  const bool geometry = name == "path" || name == "rect" || name == "circle" ||
-                        name == "ellipse" || name == "polyline" || name == "polygon" ||
-                        name == "text" || name == "use";
-  if (computed.visible &&
-      ((geometry && (computed.has_fill || computed.has_stroke)) ||
-       (name == "line" && computed.has_stroke))) {
-    return true;
+  const bool geometry = has_candidate_geometry(node);
+  if (computed.visible && geometry) {
+    if (name == "text") {
+      if (computed.has_fill || computed.has_stroke) return true;
+    } else {
+      const bool painted_fill = name != "line" && computed.has_fill;
+      const bool painted_stroke =
+          computed.has_stroke && computed.stroke_width > 0.0 &&
+          stroke_path_can_paint(node_to_path(node),
+                                to_string(computed.stroke_linecap));
+      if (painted_fill || painted_stroke) return true;
+    }
   }
 
   for (const pugi::xml_node child : node.children()) {
@@ -90,6 +122,85 @@ bool paths_are_equivalent(const fs::path& left, const fs::path& right) {
   const fs::path normalized_left = fs::weakly_canonical(left, left_error);
   const fs::path normalized_right = fs::weakly_canonical(right, right_error);
   return !left_error && !right_error && normalized_left == normalized_right;
+}
+
+std::optional<fs::path> contained_relative_path(const fs::path& input,
+                                                const fs::path& input_dir) {
+  std::error_code input_error;
+  std::error_code directory_error;
+  const fs::path absolute_input = fs::absolute(input, input_error).lexically_normal();
+  const fs::path absolute_directory =
+      fs::absolute(input_dir, directory_error).lexically_normal();
+  if (input_error || directory_error) return std::nullopt;
+
+  const fs::path relative = absolute_input.lexically_relative(absolute_directory);
+  if (relative.empty() || relative.is_absolute()) return std::nullopt;
+  for (const fs::path& component : relative) {
+    if (component == "..") return std::nullopt;
+  }
+  return relative;
+}
+
+struct DirectoryInput {
+  fs::path path;
+  bool symbolic_link = false;
+};
+
+struct ContainedFileDestination {
+  fs::path output_root;
+  fs::path relative_path;
+};
+
+FileConversionResult squish_file_with_result_impl(
+    const SvgSquisher& squisher,
+    const fs::path& input_path,
+    const fs::path& output_path,
+    const Options& options,
+    const std::optional<ContainedFileDestination>& contained_destination) {
+  FileConversionResult file;
+  file.input_path = input_path;
+  file.output_path = output_path;
+
+  try {
+    if (!options.allow_in_place && paths_are_equivalent(input_path, output_path)) {
+      file.error =
+        "Input and output resolve to the same path; enable allow_in_place explicitly";
+      return file;
+    }
+    if (!contained_destination && !options.overwrite && fs::exists(output_path)) {
+      file.skipped = true;
+      file.error = "Output already exists (use --overwrite to replace it)";
+      return file;
+    }
+
+    const std::string input = read_file(input_path);
+    ConversionResult conversion = squisher.convert_string(input, options);
+    file.diagnostics = std::move(conversion.diagnostics);
+    file.fonts_used = std::move(conversion.fonts_used);
+    file.font_identities = std::move(conversion.font_identities);
+    file.stats = conversion.stats;
+    if (!conversion.success) {
+      file.error = std::move(conversion.error);
+      return file;
+    }
+
+    const bool installed = contained_destination
+        ? write_file_contained(
+              contained_destination->output_root,
+              contained_destination->relative_path,
+              conversion.svg,
+              options.overwrite)
+        : write_file(output_path, conversion.svg, options.overwrite);
+    if (!installed) {
+      file.skipped = true;
+      file.error = "Output already exists (use --overwrite to replace it)";
+      return file;
+    }
+    file.success = true;
+  } catch (const std::exception& ex) {
+    file.error = ex.what();
+  }
+  return file;
 }
 
 }  // namespace
@@ -119,12 +230,13 @@ ConversionResult SvgSquisher::convert_string(const std::string& svg_text,
     }
 
     validate_svg_structure_depth(svg_node);
+    const SvgIdIndex id_index = build_svg_id_index(svg_node);
     result.stats.input_elements = count_svg_elements(svg_node);
     for (const pugi::xpath_node& path : svg_node.select_nodes(".//path[@d]")) {
       result.stats.input_path_commands +=
         count_path_commands(path.node().attribute("d").as_string());
     }
-    result.diagnostics = inspect_svg_capabilities(svg_node);
+    result.diagnostics = inspect_svg_capabilities(svg_node, id_index);
 
     const auto css_rules = parse_css_rules(svg_node);
     std::vector<PathEntry> paths;
@@ -155,8 +267,10 @@ ConversionResult SvgSquisher::convert_string(const std::string& svg_text,
       return result;
     }
 
+    FontSnapshotScope font_snapshot;
     OutputPrecisionScope precision_scope(options.precision);
     collect_paths_from_svg(svg_node,
+                           id_index,
                            css_rules,
                            root_style,
                            font_path,
@@ -164,21 +278,14 @@ ConversionResult SvgSquisher::convert_string(const std::string& svg_text,
                            options.font_path.has_value(),
                            &result.fonts_used,
                            &result.diagnostics,
-                           &result.stats.missing_glyphs);
+                           &result.stats.missing_glyphs,
+                           options.conversion_policy);
 
-    result.font_identities.reserve(result.fonts_used.size());
-    for (const std::string& used_font : result.fonts_used) {
-      FontIdentity identity = identify_font_file(used_font);
-      if (!identity.error.empty()) {
-        result.diagnostics.push_back({
-            DiagnosticSeverity::Warning,
-            "font-identity-unavailable",
-            "Could not capture a stable byte identity for font '" + used_font + "': " +
-                identity.error,
-            "<text>",
-        });
-      }
-      result.font_identities.push_back(std::move(identity));
+    result.font_identities = font_snapshot.identities();
+    result.fonts_used.clear();
+    result.fonts_used.reserve(result.font_identities.size());
+    for (const FontIdentity& identity : result.font_identities) {
+      result.fonts_used.push_back(identity.path);
     }
 
     if (paths.empty() && has_visible_painted_input(svg_node, css_rules, root_style)) {
@@ -199,7 +306,28 @@ ConversionResult SvgSquisher::convert_string(const std::string& svg_text,
 
     const std::vector<PathEntry> final_paths =
         prepare_output_paths(svg_node, paths, options.remove_background);
-    result.svg = render_svg_document(svg_node, final_paths, options.fill_override);
+    RenderedSvgDocument rendered =
+        render_svg_document(svg_node, final_paths, options.fill_override);
+    if (options.conversion_policy == ConversionPolicy::FilledPaths &&
+        rendered.retained_definition_has_visible_live_stroke &&
+        std::none_of(result.diagnostics.begin(), result.diagnostics.end(),
+                     [](const Diagnostic& diagnostic) {
+          return diagnostic.code == "live-stroke-retained";
+        })) {
+      result.diagnostics.push_back({
+          DiagnosticSeverity::Warning,
+          "live-stroke-retained",
+          "Filled-path conversion found a live stroke in a retained paint definition; "
+          "compatible conversion retained its SVG stroke attributes, while strict "
+          "conversion rejects this fallback.",
+          "<svg>",
+      });
+    }
+    if (options.strict && warning_count(result.diagnostics) != 0) {
+      result.error = strict_error(result.diagnostics);
+      return result;
+    }
+    result.svg = std::move(rendered.svg);
     for (const PathEntry& path : final_paths) {
       const std::size_t emitted_copies =
         (path.emit_fill ? 1U : 0U) + (path.emit_stroke ? 1U : 0U);
@@ -228,39 +356,8 @@ FileConversionResult SvgSquisher::squish_file_with_result(
     const fs::path& input_path,
     const fs::path& output_path,
     const Options& options) const {
-  FileConversionResult file;
-  file.input_path = input_path;
-  file.output_path = output_path;
-
-  try {
-    if (!options.allow_in_place && paths_are_equivalent(input_path, output_path)) {
-      file.error =
-        "Input and output resolve to the same path; enable allow_in_place explicitly";
-      return file;
-    }
-    if (!options.overwrite && fs::exists(output_path)) {
-      file.skipped = true;
-      file.error = "Output already exists (use --overwrite to replace it)";
-      return file;
-    }
-
-    const std::string input = read_file(input_path);
-    ConversionResult conversion = convert_string(input, options);
-    file.diagnostics = std::move(conversion.diagnostics);
-    file.fonts_used = std::move(conversion.fonts_used);
-    file.font_identities = std::move(conversion.font_identities);
-    file.stats = conversion.stats;
-    if (!conversion.success) {
-      file.error = std::move(conversion.error);
-      return file;
-    }
-
-    write_file(output_path, conversion.svg);
-    file.success = true;
-  } catch (const std::exception& ex) {
-    file.error = ex.what();
-  }
-  return file;
+  return squish_file_with_result_impl(
+      *this, input_path, output_path, options, std::nullopt);
 }
 
 void SvgSquisher::squish_file(const fs::path& input_path,
@@ -286,38 +383,54 @@ BatchResult SvgSquisher::squish_directory_with_result(
     return batch;
   }
 
-  std::vector<fs::path> inputs;
+  std::vector<DirectoryInput> inputs;
   std::error_code iteration_error;
   if (options.recursive) {
     for (fs::recursive_directory_iterator it(input_dir, iteration_error), end;
          it != end && !iteration_error;
          it.increment(iteration_error)) {
       std::error_code type_error;
-      if (it->is_directory(type_error)) {
+      const fs::file_status status = it->symlink_status(type_error);
+      if (type_error) {
+        iteration_error = type_error;
+        break;
+      }
+      if (fs::is_symlink(status)) {
+        if (lower_copy(it->path().extension().string()) == ".svg") {
+          inputs.push_back({it->path(), true});
+        }
+        continue;
+      }
+      if (fs::is_directory(status)) {
         if (paths_are_equivalent(it->path(), output_dir)) {
           it.disable_recursion_pending();
         }
         continue;
       }
-      if (type_error) {
-        iteration_error = type_error;
-        break;
-      }
-      if (it->is_regular_file(type_error) &&
+      if (fs::is_regular_file(status) &&
           lower_copy(it->path().extension().string()) == ".svg") {
-        inputs.push_back(it->path());
-      }
-      if (type_error) {
-        iteration_error = type_error;
-        break;
+        inputs.push_back({it->path(), false});
       }
     }
   } else {
     for (fs::directory_iterator it(input_dir, iteration_error), end;
          it != end && !iteration_error;
          it.increment(iteration_error)) {
-      if (it->is_regular_file() && lower_copy(it->path().extension().string()) == ".svg") {
-        inputs.push_back(it->path());
+      std::error_code type_error;
+      const fs::file_status status = it->symlink_status(type_error);
+      if (type_error) {
+        iteration_error = type_error;
+        break;
+      }
+      if (fs::is_symlink(status)) {
+        if (lower_copy(it->path().extension().string()) == ".svg") {
+          inputs.push_back({it->path(), true});
+        }
+        continue;
+      }
+      if (fs::is_regular_file(status) &&
+          lower_copy(it->path().extension().string()) == ".svg") {
+        inputs.push_back({it->path(), false});
       }
     }
   }
@@ -331,17 +444,39 @@ BatchResult SvgSquisher::squish_directory_with_result(
     return batch;
   }
 
-  std::sort(inputs.begin(), inputs.end(), [](const fs::path& left, const fs::path& right) {
-    return left.generic_string() < right.generic_string();
+  std::sort(inputs.begin(), inputs.end(), [](const DirectoryInput& left,
+                                             const DirectoryInput& right) {
+    return left.path.generic_string() < right.path.generic_string();
   });
 
-  for (const fs::path& input : inputs) {
-    std::error_code relative_error;
-    fs::path relative = options.recursive ? fs::relative(input, input_dir, relative_error)
-                                          : input.filename();
-    if (relative_error) relative = input.filename();
-    FileConversionResult file =
-        squish_file_with_result(input, output_dir / relative, options);
+  for (const DirectoryInput& input : inputs) {
+    const std::optional<fs::path> relative = options.recursive
+        ? contained_relative_path(input.path, input_dir)
+        : std::optional<fs::path>(input.path.filename());
+    if (!relative) {
+      FileConversionResult file;
+      file.input_path = input.path;
+      file.output_path = output_dir;
+      file.error = "Input path is not lexically contained by the input directory";
+      append_batch_result(batch, std::move(file));
+      if (!options.continue_on_error) break;
+      continue;
+    }
+    if (input.symbolic_link) {
+      FileConversionResult file;
+      file.input_path = input.path;
+      file.output_path = output_dir / *relative;
+      file.skipped = true;
+      file.error = "Symbolic-link SVG inputs are not followed during directory conversion";
+      append_batch_result(batch, std::move(file));
+      continue;
+    }
+    FileConversionResult file = squish_file_with_result_impl(
+        *this,
+        input.path,
+        output_dir / *relative,
+        options,
+        ContainedFileDestination{output_dir, *relative});
     const bool failed = !file.success && !file.skipped;
     append_batch_result(batch, std::move(file));
     if (failed && !options.continue_on_error) break;

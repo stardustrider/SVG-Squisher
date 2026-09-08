@@ -8,12 +8,12 @@ SVG Squisher keeps the command line, conversion model, and output policy separat
 2. **Structural guard** — `svg_diagnostics.cpp` iteratively verifies that the document has at most 256 element levels, including the root. This runs before XPath queries and every recursive diagnostic, lookup, and traversal pass.
 3. **Capability preflight** — `svg_diagnostics.cpp` scans known semantics that the path model cannot faithfully represent. Inline and embedded CSS declarations share one supported-property classifier. Diagnostics carry a severity, stable code, message, and element label. Strict mode stops at this boundary.
 4. **Style resolution** — `svg_style.cpp` parses the supported declaration set, simple selectors, specificity, source order, inheritance, inline styles, and importance. `svg_computed_style.cpp` turns string properties into rendering decisions.
-5. **DOM traversal** — `svg_traversal.cpp` walks elements in document order, composes transforms, suppresses hidden subtrees, and expands local references with cycle, reference-depth, combined-depth, expanded-node, and output-path guards. Capability preflight applies the same expansion budgets before strict conversion can reach serialization.
-6. **Geometry** — `svg_shape.cpp` normalizes primitives; `svg_path.cpp` validates and transforms path commands. Parser loops must either consume input or stop, which keeps malformed data bounded.
-7. **Stroke conversion** — `svg_stroke.cpp` creates fill outlines for supported solid strokes. Dashed strokes remain live when flattening them would discard dash semantics.
+5. **DOM traversal** — `svg_traversal.cpp` walks elements in document order, composes transforms, suppresses hidden subtrees, and expands local references with cycle, reference-depth, combined-depth, expanded-node, and output-path guards. Capability preflight checks reference, combined-depth, and expanded-node growth. Traversal counts actual emitted paths, and the final strict gate rejects an exhausted output budget before serialization.
+6. **Geometry** — `svg_shape.cpp` normalizes primitives. `svg_path_data.cpp` parses path data once into absolute `PathSegment` values, resolving relative, shorthand, smooth, and repeated commands. Validation, command counts, transforms, bounds, flattening, and stroke generation consume that representation; its compact serializer elides repeatable command letters and numeric separators only where SVG grammar remains unambiguous.
+7. **Stroke conversion** — `svg_stroke.cpp` creates fill outlines for supported solid strokes from the normalized path representation. The selected `ConversionPolicy` either permits a live stroke for appearance preservation or diagnoses that fallback as incompatible with filled-path output. Strict enforcement rejects the diagnostic before serialization.
 8. **Text conversion** — `svg_text.cpp` selects an authoritative or discovered font, shapes each run with HarfBuzz, and reads glyph outlines through FreeType.
 9. **Postprocessing policy** — `svg_postprocess.cpp` applies background removal only when explicitly requested. Recoloring is an independent serialization option.
-10. **Serialization and I/O** — `svg_output.cpp` emits the path-oriented document, materializes supported definition styles, removes active/unsupported definition content and external resources, and performs checked temporary-file replacement. `svg_report.cpp` emits schema-versioned JSON using the same result objects returned by the library.
+10. **Serialization and I/O** — `svg_output.cpp` emits the path-oriented document, materializes supported definition styles, removes active/unsupported definition content and external resources, and performs checked temporary-file replacement. Directory writes resolve the selected output root, reject descendant symlink/reparse parents, and revalidate containment before installation. `svg_report.cpp` emits schema-versioned JSON using the same result objects returned by the library.
 
 ## Core data contract
 
@@ -21,7 +21,7 @@ SVG Squisher keeps the command line, conversion model, and output policy separat
 
 The public header exposes:
 
-- `Options` for conversion, batch, overwrite, precision, font, recolor, cleanup, and strict policies;
+- `ConversionPolicy` and `Options` for appearance-preserving or filled-path output, batch behavior, overwrite, precision, font, recolor, cleanup, and strict enforcement;
 - `Diagnostic` and `ConversionStats` for inspectable byte, element, path, path-command, font, and missing-glyph results;
 - `ConversionResult`, `FileConversionResult`, and `BatchResult` for string, file, and directory work;
 - throwing convenience wrappers for callers that only need success/failure.

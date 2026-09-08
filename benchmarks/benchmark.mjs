@@ -17,7 +17,43 @@ import { Resvg } from "@resvg/resvg-js";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
-const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const scriptPath = fileURLToPath(import.meta.url);
+const repository = resolve(dirname(scriptPath), "..");
+
+function automaticFontCandidates(environment = process.env) {
+  return [
+    environment.WINDIR && join(environment.WINDIR, "Fonts", "arial.ttf"),
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+  ].filter(Boolean);
+}
+
+export function resolveBenchmarkFont(value, environment = process.env) {
+  if (!value) return null;
+  if (value !== "auto") {
+    const path = resolve(value);
+    if (!existsSync(path)) throw new Error(`Font does not exist: ${path}`);
+    return path;
+  }
+
+  if (environment.SVG_SQUISHER_FONT) {
+    const path = resolve(environment.SVG_SQUISHER_FONT);
+    if (!existsSync(path)) {
+      throw new Error(`SVG_SQUISHER_FONT does not exist: ${path}`);
+    }
+    return path;
+  }
+
+  const path = automaticFontCandidates(environment).find((candidate) => existsSync(candidate));
+  if (!path) {
+    throw new Error(
+      "--font auto could not find Arial or DejaVu Sans; pass --font <path> or set SVG_SQUISHER_FONT",
+    );
+  }
+  return resolve(path);
+}
 
 function usage() {
   return `Usage:
@@ -31,7 +67,8 @@ Options:
   --iterations <n>     Measured conversions per input (default: 5)
   --warmups <n>        Warm-up conversions per input (default: 1)
   --precision <0-15>   SVG Squisher output precision (default: 6)
-  --font <path>        Authoritative font passed to SVG Squisher and the renderer
+  --font <path|auto>   Authoritative font passed to SVG Squisher and the renderer;
+                       auto uses SVG_SQUISHER_FONT, then a known platform font
   --strict             Run SVG Squisher in strict mode
   --max-diff <ratio>   Fail if any rendered changed-pixel ratio exceeds this 0..1 value
   --help               Show this help
@@ -79,7 +116,7 @@ function parseArguments(argv) {
     else if (argument === "--svgo") options.svgo = valueFor(index++, argument);
     else if (argument === "--usvg") options.usvg = valueFor(index++, argument);
     else if (argument === "--output") options.output = resolve(valueFor(index++, argument));
-    else if (argument === "--font") options.font = resolve(valueFor(index++, argument));
+    else if (argument === "--font") options.font = valueFor(index++, argument);
     else if (argument === "--iterations") {
       options.iterations = positiveInteger(valueFor(index++, argument), argument);
     } else if (argument === "--warmups") {
@@ -184,14 +221,25 @@ function render(svg, background, width, font) {
   }).render().asPng());
 }
 
+export function maximumChangedPixelRatio(renderResults) {
+  return renderResults.reduce((maximum, result) => {
+    if (!result.dimensionsMatch) return 1;
+    const ratio = result.pixels === 0 ? 0 : result.changed / result.pixels;
+    return Math.max(maximum, ratio);
+  }, 0);
+}
+
 function visualDifference(inputSvg, outputSvg, font) {
-  let changed = 0;
-  let pixels = 0;
+  const renderResults = [];
   for (const width of [32, 512]) {
     for (const background of ["#ffffff", "#17191d"]) {
       const input = render(inputSvg, background, width, font);
       const output = render(outputSvg, background, width, font);
-      if (input.width !== output.width || input.height !== output.height) return 1;
+      const dimensionsMatch = input.width === output.width && input.height === output.height;
+      if (!dimensionsMatch) {
+        renderResults.push({ dimensionsMatch: false, changed: 0, pixels: 0 });
+        continue;
+      }
       const count = pixelmatch(
         input.data,
         output.data,
@@ -200,11 +248,14 @@ function visualDifference(inputSvg, outputSvg, font) {
         input.height,
         { threshold: 0.1, includeAA: false },
       );
-      changed += count;
-      pixels += input.width * input.height;
+      renderResults.push({
+        dimensionsMatch: true,
+        changed: count,
+        pixels: input.width * input.height,
+      });
     }
   }
-  return pixels === 0 ? 0 : changed / pixels;
+  return maximumChangedPixelRatio(renderResults);
 }
 
 function geometryComplexity(svg) {
@@ -290,7 +341,7 @@ function main() {
   }
   if (!options.corpus) throw new Error("--corpus is required");
   if (!statSync(options.corpus).isDirectory()) throw new Error("--corpus must name a directory");
-  if (options.font && !existsSync(options.font)) throw new Error(`Font does not exist: ${options.font}`);
+  options.font = resolveBenchmarkFont(options.font);
 
   const tools = [
     { name: "svg-squisher", executable: options.squisher },
@@ -349,9 +400,11 @@ function main() {
   if (failures) process.exitCode = 1;
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
 }

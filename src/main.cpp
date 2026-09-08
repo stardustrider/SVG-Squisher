@@ -19,6 +19,7 @@ namespace fs = std::filesystem;
 using svg_squisher::BatchResult;
 using svg_squisher::Diagnostic;
 using svg_squisher::FileConversionResult;
+using svg_squisher::ConversionPolicy;
 using svg_squisher::Options;
 using svg_squisher::SvgSquisher;
 
@@ -34,6 +35,8 @@ void print_usage(std::ostream& out) {
       << "Conversion options:\n"
       << "  --fill <color>          Recolor emitted fills and strokes without removing geometry\n"
       << "  --font <path>           Authoritative font file for text-to-path conversion\n"
+      << "  --conversion-policy <preserve-appearance|filled-paths>\n"
+      << "                          Select live-stroke preservation or filled paths\n"
       << "  --precision <0-15>      Decimal precision for generated coordinates (default: 4)\n"
       << "  --remove-background     Apply the icon-background removal heuristic\n"
       << "  --strict                Reject input that uses unsupported SVG semantics\n"
@@ -67,6 +70,13 @@ int parse_precision(const std::string& value) {
     throw std::runtime_error("--precision requires an integer from 0 to 15");
   }
   return precision;
+}
+
+ConversionPolicy parse_conversion_policy(const std::string& value) {
+  if (value == "preserve-appearance") return ConversionPolicy::PreserveAppearance;
+  if (value == "filled-paths") return ConversionPolicy::FilledPaths;
+  throw std::runtime_error(
+      "--conversion-policy requires preserve-appearance or filled-paths");
 }
 
 void print_diagnostics(const std::vector<Diagnostic>& diagnostics,
@@ -150,6 +160,9 @@ int main(int argc, char** argv) {
         options.fill_override = require_value(argc, argv, i, arg);
       } else if (parse_options && arg == "--font") {
         options.font_path = require_value(argc, argv, i, arg);
+      } else if (parse_options && arg == "--conversion-policy") {
+        options.conversion_policy =
+            parse_conversion_policy(require_value(argc, argv, i, arg));
       } else if (parse_options && arg == "--precision") {
         options.precision = parse_precision(require_value(argc, argv, i, arg));
       } else if (parse_options && arg == "--report") {

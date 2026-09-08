@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "svg_stroke.h"
 #include "svg_util.h"
 
 namespace svg_squisher {
@@ -96,28 +97,15 @@ std::string circle_stroke_to_ring(const pugi::xml_node& node, double stroke_widt
 }
 
 std::string ellipse_stroke_to_ring(const pugi::xml_node& node, double stroke_width) {
-  const double cx = attr_double(node, "cx");
-  const double cy = attr_double(node, "cy");
   const double rx = attr_double(node, "rx");
   const double ry = attr_double(node, "ry");
   if (rx <= 0.0 || ry <= 0.0 || stroke_width <= 0.0) return "";
 
-  const double outer_rx = rx + stroke_width / 2.0;
-  const double outer_ry = ry + stroke_width / 2.0;
-  const double inner_rx = std::max(0.0, rx - stroke_width / 2.0);
-  const double inner_ry = std::max(0.0, ry - stroke_width / 2.0);
-
-  std::string d = "M" + fmt(cx - outer_rx) + "," + fmt(cy) +
-                  "A" + fmt(outer_rx) + "," + fmt(outer_ry) + " 0 1 0 " + fmt(cx + outer_rx) + "," + fmt(cy) +
-                  "A" + fmt(outer_rx) + "," + fmt(outer_ry) + " 0 1 0 " + fmt(cx - outer_rx) + "," + fmt(cy) +
-                  "Z";
-  if (inner_rx > 0.0 && inner_ry > 0.0) {
-    d += " M" + fmt(cx - inner_rx) + "," + fmt(cy) +
-         "A" + fmt(inner_rx) + "," + fmt(inner_ry) + " 0 1 1 " + fmt(cx + inner_rx) + "," + fmt(cy) +
-         "A" + fmt(inner_rx) + "," + fmt(inner_ry) + " 0 1 1 " + fmt(cx - inner_rx) + "," + fmt(cy) +
-         "Z";
-  }
-  return d;
+  // Unlike a circle, an ellipse's constant-distance stroke edges are not
+  // ellipses with radii adjusted by half the stroke width. Reuse the adaptive
+  // normal-offset stroker so thick and eccentric ellipses keep their shape.
+  return build_curve_fallback_outline(
+      ellipse_to_path(node), stroke_width, "butt", "miter", 4.0);
 }
 
 std::string line_to_path(const pugi::xml_node& node) {
@@ -126,8 +114,9 @@ std::string line_to_path(const pugi::xml_node& node) {
 }
 
 std::string points_to_path(const std::string& points, bool close) {
-  const std::vector<double> values = parse_number_list(points);
-  if (values.size() < 2 || values.size() % 2 != 0) return "";
+  const auto parsed = parse_points_list(points);
+  if (!parsed || parsed->empty()) return "";
+  const std::vector<double>& values = *parsed;
 
   std::string d = "M" + fmt(values[0]) + "," + fmt(values[1]);
   for (std::size_t i = 2; i + 1 < values.size(); i += 2) {

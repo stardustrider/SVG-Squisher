@@ -1,6 +1,8 @@
 ﻿#pragma once
 
+#include <array>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,11 +20,22 @@ private:
   int previous_precision_ = 4;
 };
 
+struct CssUrlAnalysis {
+  bool has_url = false;
+  bool has_unsafe_url = false;
+  std::vector<std::string> local_fragment_ids;
+};
+
 std::string trim(std::string value);
 std::string lower_copy(std::string value);
+CssUrlAnalysis analyze_css_urls(const std::string& value);
 std::vector<std::string> split(const std::string& text, char delim);
 std::vector<double> parse_number_list(const std::string& text);
 std::vector<double> parse_length_list(const std::string& text);
+std::optional<std::vector<double>> parse_points_list(const std::string& text);
+std::optional<std::array<double, 4>> parse_viewbox(const std::string& text);
+bool is_svg_whitespace(char ch);
+void skip_svg_whitespace(const std::string& data, std::size_t& position);
 void skip_separators(const std::string& data, std::size_t& position);
 bool parse_number_token(const std::string& data,
                         std::size_t& position,

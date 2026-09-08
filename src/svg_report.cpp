@@ -102,7 +102,9 @@ std::string render_json_report_impl(const BatchResult& result,
       << "  \"generatorVersion\": \"" << json_escape(SVG_SQUISHER_VERSION) << "\",\n"
       << "  \"pathBase\": \"page\",\n"
       << "  \"options\": {"
-      << "\"strict\":" << (options.strict ? "true" : "false")
+      << "\"conversionPolicy\":\""
+      << conversion_policy_name(options.conversion_policy) << "\""
+      << ",\"strict\":" << (options.strict ? "true" : "false")
       << ",\"recursive\":" << (options.recursive ? "true" : "false")
       << ",\"continueOnError\":" << (options.continue_on_error ? "true" : "false")
       << ",\"removeBackground\":" << (options.remove_background ? "true" : "false")

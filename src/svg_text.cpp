@@ -4,7 +4,9 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -20,6 +22,7 @@
 #include <hb-ft.h>
 #include <hb.h>
 
+#include "svg_font_identity.h"
 #include "svg_util.h"
 
 namespace fs = std::filesystem;
@@ -28,8 +31,14 @@ namespace svg_squisher {
 namespace {
 
 struct FontLibrary {
+  struct CachedFace {
+    std::shared_ptr<const std::vector<unsigned char>> bytes;
+    FT_Face face = nullptr;
+  };
+
   FT_Library library = nullptr;
-  std::map<std::string, FT_Face> faces;
+  std::map<std::string, CachedFace> faces;
+  std::deque<std::string> face_order;
 
   FontLibrary() {
     if (FT_Init_FreeType(&library) != 0) {
@@ -38,9 +47,9 @@ struct FontLibrary {
   }
 
   ~FontLibrary() {
-    for (auto& [path, face] : faces) {
-      (void)path;
-      if (face) FT_Done_Face(face);
+    for (auto& [digest, cached] : faces) {
+      (void)digest;
+      if (cached.face) FT_Done_Face(cached.face);
     }
     if (library) FT_Done_FreeType(library);
   }
@@ -191,17 +200,68 @@ FontLibrary& font_library() {
   return library;
 }
 
-FT_Face load_font_face(const std::string& font_path) {
+struct LoadedFontFace {
+  FT_Face face = nullptr;
+  FontIdentity identity;
+};
+
+LoadedFontFace load_font_face(const std::string& font_path) {
+  FontData font = load_font_data(font_path);
+  if (!font.bytes || !font.identity.sha256 || !font.identity.error.empty()) {
+    throw std::runtime_error(
+      font.identity.error.empty() ? "Failed to read font: " + font_path
+                                  : font.identity.error);
+  }
+  if (font.bytes->size() > static_cast<std::size_t>(std::numeric_limits<FT_Long>::max())) {
+    throw std::runtime_error("Font is too large for FreeType: " + font_path);
+  }
+
   FontLibrary& library = font_library();
-  auto it = library.faces.find(font_path);
-  if (it != library.faces.end()) return it->second;
+  auto it = library.faces.find(*font.identity.sha256);
+  if (it != library.faces.end()) return {it->second.face, std::move(font.identity)};
 
   FT_Face face = nullptr;
-  if (FT_New_Face(library.library, font_path.c_str(), 0, &face) != 0) {
+  if (FT_New_Memory_Face(
+        library.library,
+        reinterpret_cast<const FT_Byte*>(font.bytes->data()),
+        static_cast<FT_Long>(font.bytes->size()),
+        0,
+        &face) != 0) {
     throw std::runtime_error("Failed to load font: " + font_path);
   }
-  library.faces[font_path] = face;
-  return face;
+  constexpr std::size_t max_cached_faces = 128;
+  if (library.faces.size() >= max_cached_faces) {
+    const std::string oldest_digest = library.face_order.front();
+    library.face_order.pop_front();
+    const auto oldest = library.faces.find(oldest_digest);
+    if (oldest != library.faces.end()) {
+      if (oldest->second.face) FT_Done_Face(oldest->second.face);
+      library.faces.erase(oldest);
+    }
+  }
+  try {
+    library.face_order.push_back(*font.identity.sha256);
+  } catch (...) {
+    FT_Done_Face(face);
+    throw;
+  }
+  try {
+    // Keep the local shared_ptr alive until insertion completes. FreeType may
+    // read the memory during FT_Done_Face, so an allocation failure must not
+    // destroy the face's sole backing buffer before cleanup.
+    const auto [inserted_face, inserted] = library.faces.emplace(
+      *font.identity.sha256, FontLibrary::CachedFace{font.bytes, face});
+    if (!inserted) {
+      library.face_order.pop_back();
+      FT_Done_Face(face);
+      return {inserted_face->second.face, std::move(font.identity)};
+    }
+  } catch (...) {
+    library.face_order.pop_back();
+    FT_Done_Face(face);
+    throw;
+  }
+  return {face, std::move(font.identity)};
 }
 
 struct OutlineBuilder {
@@ -473,7 +533,9 @@ TextLayoutResult text_to_path(const std::string& text,
   result.end_y = y;
   if (text.empty()) return result;
 
-  FT_Face face = load_font_face(font_path);
+  LoadedFontFace loaded_font = load_font_face(font_path);
+  FT_Face face = loaded_font.face;
+  result.font_identity = std::move(loaded_font.identity);
   if (FT_Set_Char_Size(face, 0, static_cast<FT_F26Dot6>(std::llround(font_size * 64.0)), 72, 72) != 0) {
     throw std::runtime_error("Failed to set font size for: " + font_path);
   }
@@ -603,15 +665,28 @@ double measure_text_advance(const std::string& text,
 std::optional<std::string> resolve_text_font_path(const StyleState& style,
                                                   const std::optional<std::string>& fallback_font_path,
                                                   bool fallback_is_authoritative) {
+  return resolve_text_font(style, fallback_font_path, fallback_is_authoritative).path;
+}
+
+TextFontResolution resolve_text_font(const StyleState& style,
+                                     const std::optional<std::string>& fallback_font_path,
+                                     bool fallback_is_authoritative) {
+  TextFontResolution result;
   if (fallback_is_authoritative && fallback_font_path.has_value()) {
-    return fallback_font_path;
+    result.path = fallback_font_path;
+    result.used_authoritative_font = true;
+    return result;
   }
   if (!style.font_family.empty()) {
     if (const auto family_font = discover_font_for_family(style.font_family, style.font_weight, style.font_style)) {
-      return family_font;
+      result.path = family_font;
+      return result;
     }
+    result.requested_family_unresolved = true;
   }
-  return fallback_font_path;
+  result.path = fallback_font_path;
+  result.used_fallback = result.requested_family_unresolved && fallback_font_path.has_value();
+  return result;
 }
 
 double first_coord_value(const pugi::xml_node& node, const char* attr_name, double fallback) {

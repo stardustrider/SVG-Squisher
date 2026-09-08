@@ -1,6 +1,7 @@
 ﻿#include "svg_postprocess.h"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "svg_geometry.h"
 #include "svg_output.h"
 #include "svg_paint.h"
+#include "svg_transform.h"
 #include "svg_util.h"
 
 namespace svg_squisher {
@@ -16,8 +18,8 @@ namespace {
 
 std::optional<std::pair<double, double>> parse_viewbox_size(const pugi::xml_node& svg_node) {
   if (svg_node.attribute("viewBox")) {
-    const std::vector<double> nums = parse_number_list(svg_node.attribute("viewBox").as_string());
-    if (nums.size() >= 4) return std::make_pair(nums[2], nums[3]);
+    const auto nums = parse_viewbox(svg_node.attribute("viewBox").as_string());
+    if (nums) return std::make_pair((*nums)[2], (*nums)[3]);
   }
 
   const double w = parse_double_string(svg_node.attribute("width").as_string(), 0.0);
@@ -32,6 +34,30 @@ struct EntryMeta {
   std::optional<BBox> bbox;
   double bbox_ratio = 0.0;
 };
+
+std::optional<BBox> output_space_bbox(const PathEntry& entry) {
+  const auto local = path_bbox(entry.d);
+  if (!local || trim(entry.transform).empty()) return local;
+  if (!transform_is_valid(entry.transform)) return std::nullopt;
+
+  const Matrix transform = parse_transform(entry.transform);
+  BBox transformed{
+    std::numeric_limits<double>::infinity(),
+    std::numeric_limits<double>::infinity(),
+    -std::numeric_limits<double>::infinity(),
+    -std::numeric_limits<double>::infinity(),
+  };
+  for (const Point corner : {
+           Point{local->min_x, local->min_y},
+           Point{local->max_x, local->min_y},
+           Point{local->max_x, local->max_y},
+           Point{local->min_x, local->max_y}}) {
+    bbox_add_point(transformed, apply_matrix(transform, corner));
+  }
+  return bbox_valid(transformed)
+      ? std::optional<BBox>(transformed)
+      : std::nullopt;
+}
 
 }  // namespace
 
@@ -49,7 +75,7 @@ std::vector<PathEntry> prepare_output_paths(const pugi::xml_node& svg_node,
     EntryMeta meta;
     meta.entry = entry;
     meta.analysis = analyze_path_entry(entry);
-    meta.bbox = path_bbox(entry.d);
+    meta.bbox = output_space_bbox(entry);
     if (meta.bbox && view_area > 0.0) {
       meta.bbox_ratio = (bbox_width(*meta.bbox) * bbox_height(*meta.bbox)) / view_area;
     }
