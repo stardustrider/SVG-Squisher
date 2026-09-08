@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 100 100">
+  <defs>
+    <symbol id="auto-tile" viewBox="0 0 20 10">
+      <rect width="20" height="10" fill="#26384a"/>
+    </symbol>
+  </defs>
+  <use href="#auto-tile" x="10" y="15"/>
+</svg>

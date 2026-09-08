@@ -1,17 +1,18 @@
 ﻿#include "svg_shape.h"
 
 #include <algorithm>
-#include <sstream>
 #include <string>
 #include <vector>
 
+#include "svg_stroke.h"
 #include "svg_util.h"
 
 namespace svg_squisher {
 
 double attr_double(const pugi::xml_node& node, const char* name, double fallback) {
   if (!node.attribute(name)) return fallback;
-  return node.attribute(name).as_double(fallback);
+  double value = 0.0;
+  return parse_finite_length(node.attribute(name).as_string(), value) ? value : fallback;
 }
 
 std::string rect_to_path(const pugi::xml_node& node) {
@@ -22,6 +23,9 @@ std::string rect_to_path(const pugi::xml_node& node) {
   double rx = attr_double(node, "rx");
   double ry = attr_double(node, "ry");
 
+  if (w <= 0.0 || h <= 0.0) return "";
+  if (rx < 0.0) rx = 0.0;
+  if (ry < 0.0) ry = 0.0;
   if (rx > 0.0 && ry <= 0.0) ry = rx;
   if (ry > 0.0 && rx <= 0.0) rx = ry;
   rx = std::min(rx, w / 2.0);
@@ -51,6 +55,7 @@ std::string circle_to_path(const pugi::xml_node& node) {
   const double cx = attr_double(node, "cx");
   const double cy = attr_double(node, "cy");
   const double r = attr_double(node, "r");
+  if (r <= 0.0) return "";
   return "M" + fmt(cx - r) + "," + fmt(cy) +
          "A" + fmt(r) + "," + fmt(r) + " 0 1 0 " + fmt(cx + r) + "," + fmt(cy) +
          "A" + fmt(r) + "," + fmt(r) + " 0 1 0 " + fmt(cx - r) + "," + fmt(cy) +
@@ -62,6 +67,7 @@ std::string ellipse_to_path(const pugi::xml_node& node) {
   const double cy = attr_double(node, "cy");
   const double rx = attr_double(node, "rx");
   const double ry = attr_double(node, "ry");
+  if (rx <= 0.0 || ry <= 0.0) return "";
   return "M" + fmt(cx - rx) + "," + fmt(cy) +
          "A" + fmt(rx) + "," + fmt(ry) + " 0 1 0 " + fmt(cx + rx) + "," + fmt(cy) +
          "A" + fmt(rx) + "," + fmt(ry) + " 0 1 0 " + fmt(cx - rx) + "," + fmt(cy) +
@@ -91,28 +97,15 @@ std::string circle_stroke_to_ring(const pugi::xml_node& node, double stroke_widt
 }
 
 std::string ellipse_stroke_to_ring(const pugi::xml_node& node, double stroke_width) {
-  const double cx = attr_double(node, "cx");
-  const double cy = attr_double(node, "cy");
   const double rx = attr_double(node, "rx");
   const double ry = attr_double(node, "ry");
   if (rx <= 0.0 || ry <= 0.0 || stroke_width <= 0.0) return "";
 
-  const double outer_rx = rx + stroke_width / 2.0;
-  const double outer_ry = ry + stroke_width / 2.0;
-  const double inner_rx = std::max(0.0, rx - stroke_width / 2.0);
-  const double inner_ry = std::max(0.0, ry - stroke_width / 2.0);
-
-  std::string d = "M" + fmt(cx - outer_rx) + "," + fmt(cy) +
-                  "A" + fmt(outer_rx) + "," + fmt(outer_ry) + " 0 1 0 " + fmt(cx + outer_rx) + "," + fmt(cy) +
-                  "A" + fmt(outer_rx) + "," + fmt(outer_ry) + " 0 1 0 " + fmt(cx - outer_rx) + "," + fmt(cy) +
-                  "Z";
-  if (inner_rx > 0.0 && inner_ry > 0.0) {
-    d += " M" + fmt(cx - inner_rx) + "," + fmt(cy) +
-         "A" + fmt(inner_rx) + "," + fmt(inner_ry) + " 0 1 1 " + fmt(cx + inner_rx) + "," + fmt(cy) +
-         "A" + fmt(inner_rx) + "," + fmt(inner_ry) + " 0 1 1 " + fmt(cx - inner_rx) + "," + fmt(cy) +
-         "Z";
-  }
-  return d;
+  // Unlike a circle, an ellipse's constant-distance stroke edges are not
+  // ellipses with radii adjusted by half the stroke width. Reuse the adaptive
+  // normal-offset stroker so thick and eccentric ellipses keep their shape.
+  return build_curve_fallback_outline(
+      ellipse_to_path(node), stroke_width, "butt", "miter", 4.0);
 }
 
 std::string line_to_path(const pugi::xml_node& node) {
@@ -121,16 +114,9 @@ std::string line_to_path(const pugi::xml_node& node) {
 }
 
 std::string points_to_path(const std::string& points, bool close) {
-  std::stringstream ss(points);
-  std::vector<double> values;
-  std::string token;
-  while (ss >> token) {
-    std::replace(token.begin(), token.end(), ',', ' ');
-    std::stringstream pair_stream(token);
-    double v;
-    while (pair_stream >> v) values.push_back(v);
-  }
-  if (values.size() < 2) return "";
+  const auto parsed = parse_points_list(points);
+  if (!parsed || parsed->empty()) return "";
+  const std::vector<double>& values = *parsed;
 
   std::string d = "M" + fmt(values[0]) + "," + fmt(values[1]);
   for (std::size_t i = 2; i + 1 < values.size(); i += 2) {
@@ -153,4 +139,3 @@ std::string node_to_path(const pugi::xml_node& node) {
 }
 
 }  // namespace svg_squisher
-

@@ -1,7 +1,6 @@
-﻿#include "svg_geometry.h"
+#include "svg_geometry.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -9,43 +8,11 @@
 #include <string>
 #include <vector>
 
+#include "svg_path_data.h"
 #include "svg_util.h"
 
 namespace svg_squisher {
 namespace {
-
-bool is_command_char(char ch) {
-  switch (ch) {
-    case 'M': case 'm': case 'L': case 'l': case 'H': case 'h': case 'V': case 'v':
-    case 'C': case 'c': case 'S': case 's': case 'Q': case 'q': case 'T': case 't':
-    case 'A': case 'a': case 'Z': case 'z':
-      return true;
-    default:
-      return false;
-  }
-}
-
-void skip_separators(const std::string& d, std::size_t& pos) {
-  while (pos < d.size()) {
-    const char ch = d[pos];
-    if (std::isspace(static_cast<unsigned char>(ch)) || ch == ',') {
-      ++pos;
-    } else {
-      break;
-    }
-  }
-}
-
-bool parse_number_token(const std::string& d, std::size_t& pos, double& out) {
-  skip_separators(d, pos);
-  if (pos >= d.size()) return false;
-  const char* start = d.c_str() + pos;
-  char* end = nullptr;
-  out = std::strtod(start, &end);
-  if (end == start) return false;
-  pos = static_cast<std::size_t>(end - d.c_str());
-  return true;
-}
 
 Point cubic_point(Point p0, Point p1, Point p2, Point p3, double t) {
   const double mt = 1.0 - t;
@@ -65,11 +32,165 @@ Point quad_point(Point p0, Point p1, Point p2, double t) {
   };
 }
 
-void append_curve_points(std::vector<Point>& points, const std::function<Point(double)>& sampler, int steps) {
+void append_curve_points(std::vector<Point>& points,
+                         const std::function<Point(double)>& sampler,
+                         int steps) {
   for (int i = 1; i <= steps; ++i) {
     const double t = static_cast<double>(i) / static_cast<double>(steps);
     points.push_back(sampler(t));
   }
+}
+
+constexpr double kPi = 3.14159265358979323846;
+
+struct ArcCenterParameters {
+  Point center{};
+  double radius_x = 0.0;
+  double radius_y = 0.0;
+  double rotation = 0.0;
+  double start_angle = 0.0;
+  double sweep_angle = 0.0;
+};
+
+bool points_equal(Point lhs, Point rhs) {
+  return lhs.x == rhs.x && lhs.y == rhs.y;
+}
+
+std::optional<ArcCenterParameters> compute_arc_center(
+    Point start,
+    double radius_x,
+    double radius_y,
+    double x_axis_rotation_deg,
+    int large_arc_flag,
+    int sweep_flag,
+    Point end) {
+  radius_x = std::abs(radius_x);
+  radius_y = std::abs(radius_y);
+  if (radius_x <= 0.0 || radius_y <= 0.0 || points_equal(start, end)) {
+    return std::nullopt;
+  }
+
+  ArcCenterParameters arc;
+  arc.rotation = std::fmod(x_axis_rotation_deg, 360.0) * kPi / 180.0;
+  const double cos_rotation = std::cos(arc.rotation);
+  const double sin_rotation = std::sin(arc.rotation);
+  const double half_delta_x = (start.x - end.x) / 2.0;
+  const double half_delta_y = (start.y - end.y) / 2.0;
+  const double transformed_x =
+      cos_rotation * half_delta_x + sin_rotation * half_delta_y;
+  const double transformed_y =
+      -sin_rotation * half_delta_x + cos_rotation * half_delta_y;
+
+  double unit_x = transformed_x / radius_x;
+  double unit_y = transformed_y / radius_y;
+  double radii_scale_squared = unit_x * unit_x + unit_y * unit_y;
+  if (!std::isfinite(radii_scale_squared)) return std::nullopt;
+  if (radii_scale_squared > 1.0) {
+    const double scale = std::sqrt(radii_scale_squared);
+    radius_x *= scale;
+    radius_y *= scale;
+    unit_x /= scale;
+    unit_y /= scale;
+    radii_scale_squared = unit_x * unit_x + unit_y * unit_y;
+  }
+  if (radii_scale_squared <= 0.0 || !std::isfinite(radius_x) ||
+      !std::isfinite(radius_y)) {
+    return std::nullopt;
+  }
+
+  double center_scale = std::sqrt(std::max(
+      0.0, (1.0 - radii_scale_squared) / radii_scale_squared));
+  if (large_arc_flag == sweep_flag) center_scale = -center_scale;
+  const double transformed_center_x = center_scale * radius_x * unit_y;
+  const double transformed_center_y = -center_scale * radius_y * unit_x;
+
+  arc.center = {
+    cos_rotation * transformed_center_x -
+        sin_rotation * transformed_center_y +
+        start.x * 0.5 + end.x * 0.5,
+    sin_rotation * transformed_center_x +
+        cos_rotation * transformed_center_y +
+        start.y * 0.5 + end.y * 0.5,
+  };
+  arc.radius_x = radius_x;
+  arc.radius_y = radius_y;
+
+  const double start_unit_x =
+      (transformed_x - transformed_center_x) / radius_x;
+  const double start_unit_y =
+      (transformed_y - transformed_center_y) / radius_y;
+  const double end_unit_x =
+      (-transformed_x - transformed_center_x) / radius_x;
+  const double end_unit_y =
+      (-transformed_y - transformed_center_y) / radius_y;
+  arc.start_angle = std::atan2(start_unit_y, start_unit_x);
+  arc.sweep_angle = std::atan2(
+      start_unit_x * end_unit_y - start_unit_y * end_unit_x,
+      start_unit_x * end_unit_x + start_unit_y * end_unit_y);
+  if (!sweep_flag && arc.sweep_angle > 0.0) arc.sweep_angle -= 2.0 * kPi;
+  if (sweep_flag && arc.sweep_angle < 0.0) arc.sweep_angle += 2.0 * kPi;
+
+  if (!std::isfinite(arc.center.x) || !std::isfinite(arc.center.y) ||
+      !std::isfinite(arc.start_angle) || !std::isfinite(arc.sweep_angle)) {
+    return std::nullopt;
+  }
+  return arc;
+}
+
+Point arc_point(const ArcCenterParameters& arc, double angle) {
+  const double cos_rotation = std::cos(arc.rotation);
+  const double sin_rotation = std::sin(arc.rotation);
+  const double cos_angle = std::cos(angle);
+  const double sin_angle = std::sin(angle);
+  return {
+    arc.center.x + arc.radius_x * cos_rotation * cos_angle -
+        arc.radius_y * sin_rotation * sin_angle,
+    arc.center.y + arc.radius_x * sin_rotation * cos_angle +
+        arc.radius_y * cos_rotation * sin_angle,
+  };
+}
+
+double positive_angle(double angle) {
+  angle = std::fmod(angle, 2.0 * kPi);
+  return angle < 0.0 ? angle + 2.0 * kPi : angle;
+}
+
+bool angle_is_on_arc(const ArcCenterParameters& arc, double angle) {
+  constexpr double kAngleTolerance = 1e-12;
+  if (arc.sweep_angle >= 0.0) {
+    return positive_angle(angle - arc.start_angle) <=
+           arc.sweep_angle + kAngleTolerance;
+  }
+  return positive_angle(arc.start_angle - angle) <=
+         -arc.sweep_angle + kAngleTolerance;
+}
+
+bool append_arc_bounds(BBox& box, const PathSegment& segment) {
+  bbox_add_point(box, segment.start);
+  bbox_add_point(box, segment.end);
+  if (segment.radius_x <= 0.0 || segment.radius_y <= 0.0 ||
+      points_equal(segment.start, segment.end)) {
+    return true;
+  }
+
+  const auto arc = compute_arc_center(
+      segment.start, segment.radius_x, segment.radius_y,
+      segment.x_axis_rotation, segment.large_arc ? 1 : 0,
+      segment.sweep ? 1 : 0, segment.end);
+  if (!arc) return false;
+
+  const double x_extremum = std::atan2(
+      -arc->radius_y * std::sin(arc->rotation),
+      arc->radius_x * std::cos(arc->rotation));
+  const double y_extremum = std::atan2(
+      arc->radius_y * std::cos(arc->rotation),
+      arc->radius_x * std::sin(arc->rotation));
+  for (const double angle : {
+           x_extremum, x_extremum + kPi,
+           y_extremum, y_extremum + kPi}) {
+    if (angle_is_on_arc(*arc, angle)) bbox_add_point(box, arc_point(*arc, angle));
+  }
+  return true;
 }
 
 std::vector<Point> approximate_arc(Point start,
@@ -80,134 +201,49 @@ std::vector<Point> approximate_arc(Point start,
                                    int sweep_flag,
                                    Point end) {
   std::vector<Point> points;
-  if (rx <= 0.0 || ry <= 0.0 || (std::abs(start.x - end.x) < 1e-9 && std::abs(start.y - end.y) < 1e-9)) {
+  if (rx <= 0.0 || ry <= 0.0 || points_equal(start, end)) {
     points.push_back(end);
     return points;
   }
 
-  const double phi = x_axis_rotation_deg * 3.14159265358979323846 / 180.0;
-  const double cos_phi = std::cos(phi);
-  const double sin_phi = std::sin(phi);
-  const double dx2 = (start.x - end.x) / 2.0;
-  const double dy2 = (start.y - end.y) / 2.0;
-  const double x1p = cos_phi * dx2 + sin_phi * dy2;
-  const double y1p = -sin_phi * dx2 + cos_phi * dy2;
-
-  rx = std::abs(rx);
-  ry = std::abs(ry);
-
-  const double lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
-  if (lambda > 1.0) {
-    const double scale = std::sqrt(lambda);
-    rx *= scale;
-    ry *= scale;
+  const auto arc = compute_arc_center(
+      start, rx, ry, x_axis_rotation_deg,
+      large_arc_flag, sweep_flag, end);
+  if (!arc) {
+    points.push_back(end);
+    return points;
   }
 
-  const double rx2 = rx * rx;
-  const double ry2 = ry * ry;
-  const double x1p2 = x1p * x1p;
-  const double y1p2 = y1p * y1p;
-  double numerator = rx2 * ry2 - rx2 * y1p2 - ry2 * x1p2;
-  double denominator = rx2 * y1p2 + ry2 * x1p2;
-  double factor = 0.0;
-  if (denominator > 1e-12) {
-    factor = std::sqrt(std::max(0.0, numerator / denominator));
-  }
-  if (large_arc_flag == sweep_flag) factor = -factor;
-
-  const double cxp = factor * ((rx * y1p) / ry);
-  const double cyp = factor * (-(ry * x1p) / rx);
-  const double cx = cos_phi * cxp - sin_phi * cyp + (start.x + end.x) / 2.0;
-  const double cy = sin_phi * cxp + cos_phi * cyp + (start.y + end.y) / 2.0;
-
-  auto angle_between = [](double ux, double uy, double vx, double vy) {
-    const double dot = ux * vx + uy * vy;
-    const double det = ux * vy - uy * vx;
-    return std::atan2(det, dot);
-  };
-
-  const double ux = (x1p - cxp) / rx;
-  const double uy = (y1p - cyp) / ry;
-  const double vx = (-x1p - cxp) / rx;
-  const double vy = (-y1p - cyp) / ry;
-  double theta1 = std::atan2(uy, ux);
-  double delta_theta = angle_between(ux, uy, vx, vy);
-
-  if (!sweep_flag && delta_theta > 0) delta_theta -= 2.0 * 3.14159265358979323846;
-  if (sweep_flag && delta_theta < 0) delta_theta += 2.0 * 3.14159265358979323846;
-
-  const int steps = std::max(4, static_cast<int>(std::ceil(std::abs(delta_theta) / (3.14159265358979323846 / 8.0))));
+  const int steps = std::max(
+      4, static_cast<int>(std::ceil(std::abs(arc->sweep_angle) / (kPi / 8.0))));
   for (int i = 1; i <= steps; ++i) {
-    const double theta = theta1 + delta_theta * (static_cast<double>(i) / static_cast<double>(steps));
-    const double cos_theta = std::cos(theta);
-    const double sin_theta = std::sin(theta);
-    points.push_back({
-      cx + rx * cos_phi * cos_theta - ry * sin_phi * sin_theta,
-      cy + rx * sin_phi * cos_theta + ry * cos_phi * sin_theta,
-    });
+    const double angle = arc->start_angle + arc->sweep_angle *
+        (static_cast<double>(i) / static_cast<double>(steps));
+    points.push_back(i == steps ? end : arc_point(*arc, angle));
   }
   return points;
 }
 
-std::vector<std::string> split_subpaths(const std::string& d) {
-  std::vector<std::string> subpaths;
-  std::size_t pos = 0;
-  char cmd = 0;
-  std::string current;
-
-  auto next_is_number = [&](std::size_t cursor) {
-    skip_separators(d, cursor);
-    if (cursor >= d.size()) return false;
-    const char ch = d[cursor];
-    return std::isdigit(static_cast<unsigned char>(ch)) || ch == '-' || ch == '+' || ch == '.';
-  };
-
-  while (true) {
-    skip_separators(d, pos);
-    if (pos >= d.size()) break;
-
-    if (is_command_char(d[pos])) {
-      cmd = d[pos++];
-      if ((cmd == 'M' || cmd == 'm') && !current.empty()) {
-        subpaths.push_back(trim(current));
-        current.clear();
-      }
-      current += cmd;
-    } else if (cmd == 0) {
-      break;
+std::vector<ParsedPath> split_subpaths(const ParsedPath& path) {
+  std::vector<ParsedPath> subpaths;
+  ParsedPath active;
+  for (const PathSegment& segment : path.segments) {
+    if (segment.kind == PathSegmentKind::Move && !active.segments.empty()) {
+      subpaths.push_back(std::move(active));
+      active = ParsedPath{};
     }
-
-    if (std::toupper(static_cast<unsigned char>(cmd)) == 'Z') {
-      if (!current.empty()) {
-        subpaths.push_back(trim(current));
-        current.clear();
-      }
-      continue;
-    }
-
-    while (next_is_number(pos)) {
-      double value = 0.0;
-      if (!parse_number_token(d, pos, value)) break;
-      current += (current.back() == ' ' || current.back() == ',' || is_command_char(current.back())) ? "" : ",";
-      current += fmt(value);
-      skip_separators(d, pos);
-      if (pos < d.size() && is_command_char(d[pos])) {
-        if (std::toupper(static_cast<unsigned char>(d[pos])) == 'M' && !current.empty()) {
-          subpaths.push_back(trim(current));
-          current.clear();
-        }
-        break;
-      }
-      if (pos < d.size()) current += " ";
+    active.segments.push_back(segment);
+    if (segment.kind == PathSegmentKind::Close) {
+      subpaths.push_back(std::move(active));
+      active = ParsedPath{};
     }
   }
-
-  if (!trim(current).empty()) subpaths.push_back(trim(current));
+  if (!active.segments.empty()) subpaths.push_back(std::move(active));
   return subpaths;
 }
 
-double subpath_signed_area(const std::string& d) {
-  const auto subpaths = parse_straight_subpaths(d);
+double subpath_signed_area(const ParsedPath& path) {
+  const auto subpaths = parse_straight_subpaths(serialize_path_data(path));
   if (!subpaths || subpaths->empty()) return 0.0;
   const std::vector<Point>& points = subpaths->front().points;
   if (points.size() < 3) return 0.0;
@@ -221,21 +257,21 @@ double subpath_signed_area(const std::string& d) {
   return area / 2.0;
 }
 
-std::string reverse_subpath(const std::string& d) {
-  const auto subpaths = parse_straight_subpaths(d);
-  if (!subpaths || subpaths->empty()) return d;
+std::string reverse_subpath(const ParsedPath& path) {
+  const std::string serialized = serialize_path_data(path);
+  const auto subpaths = parse_straight_subpaths(serialized);
+  if (!subpaths || subpaths->empty()) return serialized;
   const StrokeSubpath& subpath = subpaths->front();
-  if (subpath.points.empty()) return d;
+  if (subpath.points.empty()) return serialized;
 
   std::vector<Point> points = subpath.points;
   std::reverse(points.begin(), points.end());
-
-  std::string out = "M" + fmt(points.front().x) + "," + fmt(points.front().y);
+  std::string output = "M" + fmt(points.front().x) + "," + fmt(points.front().y);
   for (std::size_t i = 1; i < points.size(); ++i) {
-    out += "L" + fmt(points[i].x) + "," + fmt(points[i].y);
+    output += "L" + fmt(points[i].x) + "," + fmt(points[i].y);
   }
-  if (subpath.closed) out += "Z";
-  return out;
+  if (subpath.closed) output += "Z";
+  return output;
 }
 
 }  // namespace
@@ -266,376 +302,156 @@ double bbox_width(const BBox& box) { return bbox_valid(box) ? box.max_x - box.mi
 double bbox_height(const BBox& box) { return bbox_valid(box) ? box.max_y - box.min_y : 0.0; }
 
 std::optional<std::vector<StrokeSubpath>> parse_straight_subpaths(const std::string& d) {
-  std::vector<StrokeSubpath> subpaths;
-  std::size_t pos = 0;
-  char cmd = 0;
-  Point current{0.0, 0.0};
-  Point subpath_start{0.0, 0.0};
-  StrokeSubpath active;
+  const auto parsed = parse_path_data(d);
+  if (!parsed) return std::nullopt;
 
-  auto flush_active = [&]() {
+  std::vector<StrokeSubpath> subpaths;
+  StrokeSubpath active;
+  auto flush = [&]() {
     if (!active.points.empty()) {
       subpaths.push_back(active);
       active = StrokeSubpath{};
     }
   };
 
-  auto next_is_number = [&](std::size_t cursor) {
-    skip_separators(d, cursor);
-    if (cursor >= d.size()) return false;
-    const char ch = d[cursor];
-    return std::isdigit(static_cast<unsigned char>(ch)) || ch == '-' || ch == '+' || ch == '.';
-  };
-
-  while (true) {
-    skip_separators(d, pos);
-    if (pos >= d.size()) break;
-
-    if (is_command_char(d[pos])) {
-      cmd = d[pos++];
-    } else if (cmd == 0) {
-      return std::nullopt;
-    }
-
-    const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
-
-    if (upper == 'Z') {
-      active.closed = true;
-      current = subpath_start;
-      flush_active();
-      continue;
-    }
-
-    if (upper != 'M' && upper != 'L' && upper != 'H' && upper != 'V') {
-      return std::nullopt;
-    }
-
-    while (next_is_number(pos)) {
-      if (upper == 'M') {
-        double x = 0.0, y = 0.0;
-        if (!parse_number_token(d, pos, x) || !parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        flush_active();
-        current = {x, y};
-        subpath_start = current;
-        active.points.push_back(current);
-        cmd = relative ? 'l' : 'L';
-      } else if (upper == 'L') {
-        double x = 0.0, y = 0.0;
-        if (!parse_number_token(d, pos, x) || !parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        current = {x, y};
-        active.points.push_back(current);
-      } else if (upper == 'H') {
-        double x = 0.0;
-        if (!parse_number_token(d, pos, x)) return std::nullopt;
-        if (relative) x += current.x;
-        current.x = x;
-        active.points.push_back(current);
-      } else if (upper == 'V') {
-        double y = 0.0;
-        if (!parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) y += current.y;
-        current.y = y;
-        active.points.push_back(current);
-      }
-      skip_separators(d, pos);
-      if (pos < d.size() && is_command_char(d[pos])) break;
+  for (const PathSegment& segment : parsed->segments) {
+    switch (segment.kind) {
+      case PathSegmentKind::Move:
+        flush();
+        active.points.push_back(segment.end);
+        break;
+      case PathSegmentKind::Line:
+        if (active.points.empty()) active.points.push_back(segment.start);
+        active.points.push_back(segment.end);
+        break;
+      case PathSegmentKind::Close:
+        active.closed = true;
+        flush();
+        break;
+      case PathSegmentKind::Cubic:
+      case PathSegmentKind::Quadratic:
+      case PathSegmentKind::Arc:
+        return std::nullopt;
     }
   }
-
-  flush_active();
+  flush();
   return subpaths;
 }
 
-std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::string& d) {
-  std::vector<StrokeSubpath> subpaths;
-  std::size_t pos = 0;
-  char cmd = 0;
-  char prev_cmd = 0;
-  Point current{0.0, 0.0};
-  Point subpath_start{0.0, 0.0};
-  Point last_cubic_ctrl{0.0, 0.0};
-  Point last_quad_ctrl{0.0, 0.0};
-  bool has_last_cubic = false;
-  bool has_last_quad = false;
-  StrokeSubpath active;
+std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(
+    const std::string& d,
+    std::size_t* semantic_command_count) {
+  const auto parsed = parse_path_data(d);
+  if (!parsed) return std::nullopt;
+  if (semantic_command_count) *semantic_command_count = parsed->segments.size();
 
-  auto flush_active = [&]() {
+  std::vector<StrokeSubpath> subpaths;
+  StrokeSubpath active;
+  auto flush = [&]() {
     if (!active.points.empty()) {
       subpaths.push_back(active);
       active = StrokeSubpath{};
     }
   };
-
-  auto push_point = [&](Point p) {
+  const auto push_point = [&](Point point) {
     if (active.points.empty() ||
-        std::abs(active.points.back().x - p.x) > 1e-6 ||
-        std::abs(active.points.back().y - p.y) > 1e-6) {
-      active.points.push_back(p);
+        std::abs(active.points.back().x - point.x) > 1e-6 ||
+        std::abs(active.points.back().y - point.y) > 1e-6) {
+      active.points.push_back(point);
     }
   };
 
-  auto next_is_number = [&](std::size_t cursor) {
-    skip_separators(d, cursor);
-    if (cursor >= d.size()) return false;
-    const char ch = d[cursor];
-    return std::isdigit(static_cast<unsigned char>(ch)) || ch == '-' || ch == '+' || ch == '.';
-  };
-
-  while (true) {
-    skip_separators(d, pos);
-    if (pos >= d.size()) break;
-
-    if (is_command_char(d[pos])) {
-      cmd = d[pos++];
-    } else if (cmd == 0) {
-      return std::nullopt;
-    }
-
-    const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
-
-    if (upper == 'Z') {
-      active.closed = true;
-      current = subpath_start;
-      flush_active();
-      has_last_cubic = false;
-      has_last_quad = false;
-      prev_cmd = 'Z';
-      continue;
-    }
-
-    while (next_is_number(pos)) {
-      if (upper == 'M') {
-        double x=0.0,y=0.0;
-        if (!parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        flush_active();
-        current = {x,y};
-        subpath_start = current;
-        push_point(current);
-        cmd = relative ? 'l' : 'L';
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'M';
-      } else if (upper == 'L') {
-        double x=0.0,y=0.0;
-        if (!parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        current = {x,y};
-        push_point(current);
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'L';
-      } else if (upper == 'H') {
-        double x=0.0;
-        if (!parse_number_token(d,pos,x)) return std::nullopt;
-        if (relative) x += current.x;
-        current.x = x;
-        push_point(current);
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'H';
-      } else if (upper == 'V') {
-        double y=0.0;
-        if (!parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) y += current.y;
-        current.y = y;
-        push_point(current);
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'V';
-      } else if (upper == 'C') {
-        double x1=0,y1=0,x2=0,y2=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x1) || !parse_number_token(d,pos,y1) ||
-            !parse_number_token(d,pos,x2) || !parse_number_token(d,pos,y2) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x1 += current.x; y1 += current.y; x2 += current.x; y2 += current.y; x += current.x; y += current.y; }
-        const Point p0 = current;
-        const Point p1{x1,y1}, p2{x2,y2}, p3{x,y};
-        append_curve_points(active.points, [&](double t) { return cubic_point(p0,p1,p2,p3,t); }, 12);
-        current = p3;
-        last_cubic_ctrl = p2;
-        has_last_cubic = true;
-        has_last_quad = false;
-        prev_cmd = 'C';
-      } else if (upper == 'S') {
-        double x2=0,y2=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x2) || !parse_number_token(d,pos,y2) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        Point p1 = current;
-        if (has_last_cubic && (prev_cmd == 'C' || prev_cmd == 'S')) {
-          p1 = {2 * current.x - last_cubic_ctrl.x, 2 * current.y - last_cubic_ctrl.y};
-        }
-        if (relative) { x2 += current.x; y2 += current.y; x += current.x; y += current.y; }
-        const Point p0 = current;
-        const Point p2{x2,y2}, p3{x,y};
-        append_curve_points(active.points, [&](double t) { return cubic_point(p0,p1,p2,p3,t); }, 12);
-        current = p3;
-        last_cubic_ctrl = p2;
-        has_last_cubic = true;
-        has_last_quad = false;
-        prev_cmd = 'S';
-      } else if (upper == 'Q') {
-        double x1=0,y1=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x1) || !parse_number_token(d,pos,y1) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x1 += current.x; y1 += current.y; x += current.x; y += current.y; }
-        const Point p0 = current;
-        const Point p1{x1,y1}, p2{x,y};
-        append_curve_points(active.points, [&](double t) { return quad_point(p0,p1,p2,t); }, 10);
-        current = p2;
-        last_quad_ctrl = p1;
-        has_last_quad = true;
-        has_last_cubic = false;
-        prev_cmd = 'Q';
-      } else if (upper == 'T') {
-        double x=0,y=0;
-        if (!parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        Point ctrl = current;
-        if (has_last_quad && (prev_cmd == 'Q' || prev_cmd == 'T')) {
-          ctrl = {2 * current.x - last_quad_ctrl.x, 2 * current.y - last_quad_ctrl.y};
-        }
-        if (relative) { x += current.x; y += current.y; }
-        const Point p0 = current;
-        const Point p2{x,y};
-        append_curve_points(active.points, [&](double t) { return quad_point(p0,ctrl,p2,t); }, 10);
-        current = p2;
-        last_quad_ctrl = ctrl;
-        has_last_quad = true;
-        has_last_cubic = false;
-        prev_cmd = 'T';
-      } else if (upper == 'A') {
-        double rx=0,ry=0,rot=0,large=0,sweep=0,x=0,y=0;
-        if (!parse_number_token(d,pos,rx) || !parse_number_token(d,pos,ry) ||
-            !parse_number_token(d,pos,rot) || !parse_number_token(d,pos,large) ||
-            !parse_number_token(d,pos,sweep) || !parse_number_token(d,pos,x) ||
-            !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        const Point end{x,y};
-        const auto arc_points = approximate_arc(current, rx, ry, rot, static_cast<int>(large), static_cast<int>(sweep), end);
-        active.points.insert(active.points.end(), arc_points.begin(), arc_points.end());
-        current = end;
-        has_last_cubic = false;
-        has_last_quad = false;
-        prev_cmd = 'A';
-      } else {
-        return std::nullopt;
+  for (const PathSegment& segment : parsed->segments) {
+    switch (segment.kind) {
+      case PathSegmentKind::Move:
+        flush();
+        push_point(segment.end);
+        break;
+      case PathSegmentKind::Line:
+        if (active.points.empty()) push_point(segment.start);
+        push_point(segment.end);
+        break;
+      case PathSegmentKind::Cubic:
+        if (active.points.empty()) push_point(segment.start);
+        append_curve_points(active.points, [&](double t) {
+          return cubic_point(segment.start, segment.control1,
+                             segment.control2, segment.end, t);
+        }, 12);
+        break;
+      case PathSegmentKind::Quadratic:
+        if (active.points.empty()) push_point(segment.start);
+        append_curve_points(active.points, [&](double t) {
+          return quad_point(segment.start, segment.control1, segment.end, t);
+        }, 10);
+        break;
+      case PathSegmentKind::Arc: {
+        if (active.points.empty()) push_point(segment.start);
+        const auto points = approximate_arc(
+            segment.start, segment.radius_x, segment.radius_y,
+            segment.x_axis_rotation, segment.large_arc ? 1 : 0,
+            segment.sweep ? 1 : 0, segment.end);
+        for (const Point point : points) push_point(point);
+        break;
       }
-
-      skip_separators(d, pos);
-      if (pos < d.size() && is_command_char(d[pos])) break;
+      case PathSegmentKind::Close:
+        active.closed = true;
+        flush();
+        break;
     }
   }
-
-  flush_active();
+  flush();
   return subpaths;
 }
 
 std::string convert_evenodd_to_nonzero(const std::string& d) {
-  const std::vector<std::string> subpaths = split_subpaths(d);
+  const auto parsed = parse_path_data(d);
+  if (!parsed) return d;
+  const std::vector<ParsedPath> subpaths = split_subpaths(*parsed);
   if (subpaths.size() <= 1) return d;
 
-  const bool outer_cw = subpath_signed_area(subpaths.front()) >= 0.0;
-  std::string out = subpaths.front();
+  const bool outer_clockwise = subpath_signed_area(subpaths.front()) >= 0.0;
+  std::string output = serialize_path_data(subpaths.front());
   for (std::size_t i = 1; i < subpaths.size(); ++i) {
-    const bool hole_cw = subpath_signed_area(subpaths[i]) >= 0.0;
-    out += " ";
-    out += (hole_cw == outer_cw) ? reverse_subpath(subpaths[i]) : subpaths[i];
+    const bool hole_clockwise = subpath_signed_area(subpaths[i]) >= 0.0;
+    output += " ";
+    output += hole_clockwise == outer_clockwise
+        ? reverse_subpath(subpaths[i])
+        : serialize_path_data(subpaths[i]);
   }
-  return out;
+  return output;
 }
 
 std::optional<BBox> path_bbox(const std::string& d) {
-  std::size_t pos = 0;
-  char cmd = 0;
-  Point current{0.0, 0.0};
+  const auto parsed = parse_path_data(d);
+  if (!parsed) return std::nullopt;
+
   BBox box{
     std::numeric_limits<double>::infinity(),
     std::numeric_limits<double>::infinity(),
     -std::numeric_limits<double>::infinity(),
-    -std::numeric_limits<double>::infinity()
+    -std::numeric_limits<double>::infinity(),
   };
-
-  auto next_is_number = [&](std::size_t cursor) {
-    skip_separators(d, cursor);
-    if (cursor >= d.size()) return false;
-    const char ch = d[cursor];
-    return std::isdigit(static_cast<unsigned char>(ch)) || ch == '-' || ch == '+' || ch == '.';
-  };
-
-  while (true) {
-    skip_separators(d, pos);
-    if (pos >= d.size()) break;
-
-    if (is_command_char(d[pos])) {
-      cmd = d[pos++];
-    } else if (cmd == 0) {
-      return std::nullopt;
-    }
-
-    const bool relative = std::islower(static_cast<unsigned char>(cmd)) != 0;
-    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
-    if (upper == 'Z') continue;
-
-    while (next_is_number(pos)) {
-      if (upper == 'M' || upper == 'L') {
-        double x = 0.0, y = 0.0;
-        if (!parse_number_token(d, pos, x) || !parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        current = {x, y};
-        bbox_add_point(box, current);
-      } else if (upper == 'H') {
-        double x = 0.0;
-        if (!parse_number_token(d, pos, x)) return std::nullopt;
-        if (relative) x += current.x;
-        current.x = x;
-        bbox_add_point(box, current);
-      } else if (upper == 'V') {
-        double y = 0.0;
-        if (!parse_number_token(d, pos, y)) return std::nullopt;
-        if (relative) y += current.y;
-        current.y = y;
-        bbox_add_point(box, current);
-      } else if (upper == 'C') {
-        double x1=0,y1=0,x2=0,y2=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x1) || !parse_number_token(d,pos,y1) ||
-            !parse_number_token(d,pos,x2) || !parse_number_token(d,pos,y2) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x1 += current.x; y1 += current.y; x2 += current.x; y2 += current.y; x += current.x; y += current.y; }
-        bbox_add_point(box, {x1,y1});
-        bbox_add_point(box, {x2,y2});
-        current = {x,y};
-        bbox_add_point(box, current);
-      } else if (upper == 'Q') {
-        double x1=0,y1=0,x=0,y=0;
-        if (!parse_number_token(d,pos,x1) || !parse_number_token(d,pos,y1) ||
-            !parse_number_token(d,pos,x) || !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x1 += current.x; y1 += current.y; x += current.x; y += current.y; }
-        bbox_add_point(box, {x1,y1});
-        current = {x,y};
-        bbox_add_point(box, current);
-      } else if (upper == 'A') {
-        double rx=0,ry=0,rot=0,large=0,sweep=0,x=0,y=0;
-        if (!parse_number_token(d,pos,rx) || !parse_number_token(d,pos,ry) ||
-            !parse_number_token(d,pos,rot) || !parse_number_token(d,pos,large) ||
-            !parse_number_token(d,pos,sweep) || !parse_number_token(d,pos,x) ||
-            !parse_number_token(d,pos,y)) return std::nullopt;
-        if (relative) { x += current.x; y += current.y; }
-        bbox_add_point(box, {x - rx, y - ry});
-        bbox_add_point(box, {x + rx, y + ry});
-        current = {x,y};
-        bbox_add_point(box, current);
-      } else {
-        return std::nullopt;
-      }
-      skip_separators(d, pos);
-      if (pos < d.size() && is_command_char(d[pos])) break;
+  for (const PathSegment& segment : parsed->segments) {
+    switch (segment.kind) {
+      case PathSegmentKind::Move:
+      case PathSegmentKind::Line:
+      case PathSegmentKind::Close:
+        bbox_add_point(box, segment.end);
+        break;
+      case PathSegmentKind::Cubic:
+        bbox_add_point(box, segment.control1);
+        bbox_add_point(box, segment.control2);
+        bbox_add_point(box, segment.end);
+        break;
+      case PathSegmentKind::Quadratic:
+        bbox_add_point(box, segment.control1);
+        bbox_add_point(box, segment.end);
+        break;
+      case PathSegmentKind::Arc:
+        if (!append_arc_bounds(box, segment)) return std::nullopt;
+        break;
     }
   }
-
   if (!bbox_valid(box)) return std::nullopt;
   return box;
 }
@@ -651,4 +467,3 @@ bool bbox_contains(const std::optional<BBox>& outer,
 }
 
 }  // namespace svg_squisher
-

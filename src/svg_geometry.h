@@ -31,7 +31,9 @@ double bbox_width(const BBox& box);
 double bbox_height(const BBox& box);
 
 std::optional<std::vector<StrokeSubpath>> parse_straight_subpaths(const std::string& d);
-std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(const std::string& d);
+std::optional<std::vector<StrokeSubpath>> flatten_path_subpaths(
+    const std::string& d,
+    std::size_t* semantic_command_count = nullptr);
 std::string convert_evenodd_to_nonzero(const std::string& d);
 std::optional<BBox> path_bbox(const std::string& d);
 bool bbox_contains(const std::optional<BBox>& outer,
@@ -39,4 +41,3 @@ bool bbox_contains(const std::optional<BBox>& outer,
                    double tolerance = 0.75);
 
 }  // namespace svg_squisher
-

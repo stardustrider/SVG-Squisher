@@ -7,7 +7,8 @@ namespace svg_squisher {
 ParsedPaint parse_paint(const std::string& paint, double opacity) {
   ParsedPaint parsed;
   parsed.raw = paint;
-  parsed.normalized = lower_copy(trim(paint));
+  const std::string trimmed = trim(paint);
+  parsed.normalized = lower_copy(trimmed);
 
   if (parsed.normalized.empty() || parsed.normalized == "none" || opacity <= 1e-6) {
     parsed.kind = PaintKind::None;
@@ -15,15 +16,13 @@ ParsedPaint parse_paint(const std::string& paint, double opacity) {
     return parsed;
   }
 
-  if (parsed.normalized.size() >= 7 && parsed.normalized.rfind("url(", 0) == 0) {
-    const std::size_t hash = parsed.normalized.find('#');
-    const std::size_t close = parsed.normalized.rfind(')');
-    if (hash != std::string::npos && close != std::string::npos && hash + 1 < close) {
-      parsed.kind = PaintKind::Url;
-      parsed.url_id = parsed.normalized.substr(hash + 1, close - hash - 1);
-      parsed.visible = true;
-      return parsed;
-    }
+  const CssUrlAnalysis urls = analyze_css_urls(trimmed);
+  if (urls.has_url && !urls.has_unsafe_url &&
+      !urls.local_fragment_ids.empty()) {
+    parsed.kind = PaintKind::Url;
+    parsed.url_id = urls.local_fragment_ids.front();
+    parsed.visible = true;
+    return parsed;
   }
 
   parsed.kind = PaintKind::Value;
@@ -56,4 +55,3 @@ std::optional<double> paint_brightness(const std::string& paint) {
 }
 
 }  // namespace svg_squisher
-

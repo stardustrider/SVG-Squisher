@@ -1,0 +1,436 @@
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "svg_squisher.h"
+#include "svg_style.h"
+#include "svg_text.h"
+
+namespace {
+
+int failures = 0;
+
+void expect(bool condition, const std::string& message) {
+  if (!condition) {
+    std::cerr << "FAIL: " << message << '\n';
+    ++failures;
+  }
+}
+
+bool contains_diagnostic(const svg_squisher::ConversionResult& result,
+                         const std::string& code) {
+  return std::any_of(
+    result.diagnostics.begin(), result.diagnostics.end(),
+    [&](const svg_squisher::Diagnostic& diagnostic) { return diagnostic.code == code; });
+}
+
+bool contains_diagnostic_message(const svg_squisher::ConversionResult& result,
+                                 const std::string& code,
+                                 const std::string& fragment) {
+  return std::any_of(
+    result.diagnostics.begin(), result.diagnostics.end(),
+    [&](const svg_squisher::Diagnostic& diagnostic) {
+      return diagnostic.code == code && diagnostic.message.find(fragment) != std::string::npos;
+    });
+}
+
+std::string svg(const std::string& body) {
+  return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" "
+         "viewBox=\"0 0 100 100\">" + body + "</svg>";
+}
+
+std::string convert(const std::string& source,
+                    const std::optional<std::string>& font = std::nullopt) {
+  svg_squisher::Options options;
+  options.font_path = font;
+  return svg_squisher::SvgSquisher{}.squish_string(source, options);
+}
+
+std::size_t count_occurrences(const std::string& text, const std::string& needle) {
+  std::size_t count = 0;
+  std::size_t cursor = 0;
+  while ((cursor = text.find(needle, cursor)) != std::string::npos) {
+    ++count;
+    cursor += needle.size();
+  }
+  return count;
+}
+
+std::string concatenated_path_data(const std::string& output) {
+  std::string paths;
+  std::size_t cursor = 0;
+  constexpr const char* marker = "<path d=\"";
+  while ((cursor = output.find(marker, cursor)) != std::string::npos) {
+    cursor += std::char_traits<char>::length(marker);
+    const std::size_t end = output.find('"', cursor);
+    if (end == std::string::npos) break;
+    paths.append(output, cursor, end - cursor);
+    cursor = end + 1;
+  }
+  return paths;
+}
+
+void test_css_cascade() {
+  const std::string inline_output = convert(svg(
+    "<rect width=\"100\" height=\"100\" fill=\"red\" style=\"fill: blue\"/>"));
+  expect(inline_output.find("fill=\"blue\"") != std::string::npos,
+         "inline style overrides a presentation attribute");
+
+  const std::string specificity_output = convert(svg(
+    "<style>.shape { fill: green; } #target { fill: purple; }</style>"
+    "<rect id=\"target\" class=\"shape\" width=\"10\" height=\"10\" fill=\"red\"/>"));
+  expect(specificity_output.find("fill=\"purple\"") != std::string::npos,
+         "ID specificity wins regardless of presentation attributes and class rules");
+
+  const std::string important_output = convert(svg(
+    "<style>.shape { fill: green ! important; }</style>"
+    "<rect class=\"shape\" width=\"10\" height=\"10\" style=\"fill: blue\"/>"));
+  expect(important_output.find("fill=\"green\"") != std::string::npos,
+         "important author rule overrides a non-important inline declaration");
+}
+
+void test_opacity_and_hidden_content() {
+  const std::string alpha_output = convert(svg(
+    "<rect width=\"40\" height=\"40\" fill=\"red\" fill-opacity=\"0.25\"/>"
+    "<path d=\"M0 60L40 60\" fill=\"none\" stroke=\"blue\" "
+    "stroke-width=\"4\" stroke-opacity=\"0.4\"/>"));
+  expect(alpha_output.find("fill-opacity=\"0.25\"") != std::string::npos,
+         "fill opacity survives conversion");
+  expect(alpha_output.find("fill-opacity=\"0.4\"") != std::string::npos ||
+         alpha_output.find("stroke-opacity=\"0.4\"") != std::string::npos,
+         "stroke opacity survives live or outlined stroke conversion");
+
+  const std::string display_output = convert(svg(
+    "<g display=\"none\"><rect width=\"100\" height=\"100\" fill=\"red\"/></g>"
+    "<rect width=\"10\" height=\"10\" fill=\"green\"/>"));
+  expect(count_occurrences(display_output, "<path ") == 1 &&
+         display_output.find("fill=\"green\"") != std::string::npos,
+         "display none removes the entire hidden subtree");
+
+  const std::string visibility_output = convert(svg(
+    "<g visibility=\"hidden\">"
+    "<rect width=\"20\" height=\"20\" fill=\"red\"/>"
+    "<rect x=\"30\" width=\"20\" height=\"20\" fill=\"green\" visibility=\"visible\"/>"
+    "</g>"));
+  expect(count_occurrences(visibility_output, "<path ") == 1 &&
+         visibility_output.find("fill=\"green\"") != std::string::npos,
+         "visibility remains inheritable and descendants can opt back into rendering");
+}
+
+void test_references_and_root_transform() {
+  const std::string symbol_output = convert(svg(
+    "<defs><symbol id=\"tile\" viewBox=\"0 0 10 10\">"
+    "<rect width=\"10\" height=\"10\" fill=\"red\"/>"
+    "</symbol></defs><use href=\"#tile\" x=\"5\" y=\"7\" width=\"20\" height=\"20\"/>"));
+  expect(count_occurrences(symbol_output, "<path ") == 1 &&
+         symbol_output.find("fill=\"red\"") != std::string::npos,
+         "a symbol referenced by use is traversed");
+  expect(concatenated_path_data(symbol_output).find("25") != std::string::npos,
+         "symbol viewBox is mapped into the use viewport");
+
+  const std::string cyclic_output = convert(svg("<use id=\"loop\" href=\"#loop\"/>"));
+  expect(count_occurrences(cyclic_output, "<path ") == 0,
+         "cyclic use references terminate without emitting recursive geometry");
+
+  const std::string transformed_output = convert(
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" transform=\"translate(5 7)\">"
+    "<rect width=\"10\" height=\"10\"/></svg>");
+  expect(concatenated_path_data(transformed_output).find("M5 7") != std::string::npos,
+         "the SVG root transform participates in traversal");
+}
+
+void test_case_sensitive_quoted_paint_reference() {
+  const std::string output = convert(svg(
+    "<defs><linearGradient id=\"BrandGradient\">"
+    "<stop offset=\"0\" stop-color=\"red\"/>"
+    "<stop offset=\"1\" stop-color=\"blue\"/>"
+    "</linearGradient></defs>"
+    "<rect width=\"100\" height=\"100\" fill=\"url('#BrandGradient')\"/>"));
+
+  expect(output.find("id=\"BrandGradient\"") != std::string::npos,
+         "quoted local paint references retain the referenced definition");
+  expect(output.find("fill=\"url(&apos;#BrandGradient&apos;)\"") != std::string::npos ||
+             output.find("fill=\"url('#BrandGradient')\"") != std::string::npos,
+         "paint-server IDs remain case-sensitive when serialized");
+}
+
+void test_stroke_and_open_fill_fidelity() {
+  const std::string malformed = convert(svg(
+    "<path d=\"M0 0 X\" fill=\"red\"/><rect width=\"10\" height=\"10\" fill=\"green\"/>"));
+  expect(count_occurrences(malformed, "<path ") == 1 &&
+         malformed.find("fill=\"green\"") != std::string::npos,
+         "invalid path data is skipped while compatible conversion continues");
+
+  const std::string dashed_circle = convert(svg(
+    "<circle cx=\"50\" cy=\"50\" r=\"30\" fill=\"none\" stroke=\"red\" "
+    "stroke-width=\"5\" stroke-dasharray=\"6 6\"/>"));
+  expect(count_occurrences(dashed_circle, "<path ") == 1 &&
+         dashed_circle.find("stroke=\"red\"") != std::string::npos &&
+         dashed_circle.find("stroke-dasharray=\"6 6\"") != std::string::npos,
+         "a dashed circle remains a live dashed stroke");
+
+  const std::string inherited_fill = convert(svg(
+    "<g fill=\"red\"><path d=\"M10 10L90 10L90 90\" stroke=\"blue\" "
+    "stroke-width=\"4\"/></g>"));
+  expect(inherited_fill.find("fill=\"red\"") != std::string::npos,
+         "an open path retains its inherited fill");
+}
+
+void test_utf8_and_text_runs() {
+  const std::vector<char32_t> decoded = svg_squisher::decode_utf8("A\xc3\xa9\xf0\x9f\x98\x80");
+  expect(decoded == std::vector<char32_t>({U'A', U'\u00e9', U'\U0001f600'}),
+         "UTF-8 decoding maps multi-byte sequences to Unicode scalar values");
+  expect(svg_squisher::decode_utf8("\xed\xa0\x80") ==
+           std::vector<char32_t>({0xfffd, 0xfffd, 0xfffd}),
+         "invalid UTF-8 never produces a surrogate scalar");
+
+  const std::optional<std::string> font = svg_squisher::discover_default_font();
+  expect(font.has_value(), "a default test font is available");
+  if (!font) return;
+
+  const std::string plain = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">ABC</text>"), font));
+  const std::string spanned = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A<tspan>B</tspan>C</text>"), font));
+  expect(!plain.empty() && spanned == plain,
+         "text and tspan glyphs are emitted in document order");
+
+  svg_squisher::Options strict_text;
+  strict_text.strict = true;
+  strict_text.font_path = font;
+  const auto direct_kerning = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">AV</text>"), strict_text);
+  const auto split_kerning = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A<tspan>V</tspan></text>"),
+    strict_text);
+  expect(direct_kerning.success && split_kerning.success &&
+           direct_kerning.diagnostics.empty() && split_kerning.diagnostics.empty() &&
+           split_kerning.stats.output_paths == 1 &&
+           concatenated_path_data(split_kerning.svg) ==
+             concatenated_path_data(direct_kerning.svg),
+         "a style-neutral tspan preserves cross-boundary kerning in strict output");
+
+  const auto semantic_kerning = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A"
+    "<tspan id=\"semantic\" class=\"same-style\">V</tspan></text>"),
+    strict_text);
+  expect(semantic_kerning.success && semantic_kerning.diagnostics.empty() &&
+           semantic_kerning.stats.output_paths == 1 &&
+           concatenated_path_data(semantic_kerning.svg) ==
+             concatenated_path_data(direct_kerning.svg),
+         "id and class metadata do not break cross-boundary kerning when resolved style is unchanged");
+
+  const auto direct_ligature = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">office</text>"), strict_text);
+  const auto split_ligature = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">of<tspan><tspan>fi</tspan></tspan>ce</text>"),
+    strict_text);
+  expect(direct_ligature.success && split_ligature.success &&
+           direct_ligature.diagnostics.empty() && split_ligature.diagnostics.empty() &&
+           split_ligature.stats.output_paths == 1 &&
+           concatenated_path_data(split_ligature.svg) ==
+             concatenated_path_data(direct_ligature.svg),
+         "nested style-neutral tspans preserve whole-run ligature shaping in strict output");
+
+  const auto nested_semantic_ligature =
+    svg_squisher::SvgSquisher{}.convert_string(svg(
+      "<text x=\"10\" y=\"50\" font-size=\"30\">of"
+      "<tspan id=\"outer-semantic\"><tspan class=\"inner-semantic\">fi</tspan>"
+      "</tspan>ce</text>"), strict_text);
+  expect(nested_semantic_ligature.success &&
+           nested_semantic_ligature.diagnostics.empty() &&
+           nested_semantic_ligature.stats.output_paths == 1 &&
+           concatenated_path_data(nested_semantic_ligature.svg) ==
+             concatenated_path_data(direct_ligature.svg),
+         "nested semantic tspan metadata preserves whole-run ligature shaping");
+
+  const auto paint_boundary = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A<tspan fill=\"red\">V</tspan></text>"),
+    strict_text);
+  expect(paint_boundary.success && paint_boundary.stats.output_paths == 2 &&
+           paint_boundary.svg.find("fill=\"black\"") != std::string::npos &&
+           paint_boundary.svg.find("fill=\"red\"") != std::string::npos,
+         "a paint-changing tspan remains a separate shaped output run");
+
+  const auto class_style_boundary =
+    svg_squisher::SvgSquisher{}.convert_string(svg(
+      "<style>.changed{fill:red}</style>"
+      "<text x=\"10\" y=\"50\" font-size=\"30\">A"
+      "<tspan class=\"changed\">V</tspan></text>"), strict_text);
+  expect(class_style_boundary.success &&
+           class_style_boundary.stats.output_paths == 2 &&
+           class_style_boundary.svg.find("fill=\"black\"") != std::string::npos &&
+           class_style_boundary.svg.find("fill=\"red\"") != std::string::npos,
+         "class metadata remains a shaping barrier when its resolved paint changes");
+
+  const double mixed_anchor_advance =
+    svg_squisher::measure_text_advance("AA", 12.0, *font) +
+    svg_squisher::measure_text_advance("BB", 42.0, *font);
+  const std::string mixed_text =
+    "AA<tspan font-size=\"42\">BB</tspan>";
+  const auto mixed_anchor = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"90\" y=\"55\" text-anchor=\"end\" font-size=\"12\">" +
+    mixed_text + "</text>"), strict_text);
+  const auto explicit_mixed_start = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"" + std::to_string(90.0 - mixed_anchor_advance) +
+    "\" y=\"55\" text-anchor=\"start\" font-size=\"12\">" +
+    mixed_text + "</text>"), strict_text);
+  expect(mixed_anchor.success && explicit_mixed_start.success &&
+           mixed_anchor.diagnostics.empty() &&
+           explicit_mixed_start.diagnostics.empty() &&
+           mixed_anchor.stats.output_paths == 2 &&
+           concatenated_path_data(mixed_anchor.svg) ==
+             concatenated_path_data(explicit_mixed_start.svg),
+         "end anchoring measures descendant tspans with their resolved font metrics");
+
+  svg_squisher::Options compatible_text = strict_text;
+  compatible_text.strict = false;
+  const std::string complex_anchor_source = svg(
+    "<text x=\"30\" y=\"55\" text-anchor=\"end\" font-size=\"20\">"
+    "A<tspan x=\"70\">V</tspan>A</text>");
+  const auto compatible_complex_anchor =
+    svg_squisher::SvgSquisher{}.convert_string(
+      complex_anchor_source, compatible_text);
+  const auto strict_complex_anchor =
+    svg_squisher::SvgSquisher{}.convert_string(complex_anchor_source, strict_text);
+  expect(compatible_complex_anchor.success &&
+           contains_diagnostic_message(
+             compatible_complex_anchor,
+             "unsupported-text-anchor-chunk-positioning",
+             "preserves logical x/y/dx/dy list consumption") &&
+           !strict_complex_anchor.success && strict_complex_anchor.svg.empty() &&
+           strict_complex_anchor.error.find(
+             "unsupported-text-anchor-chunk-positioning") != std::string::npos,
+         "complex absolute-positioned anchor chunks have an explicit compatible fallback and strict rejection");
+
+  const auto strict_anchor_list = svg_squisher::SvgSquisher{}.convert_string(svg(
+    "<text x=\"30 70\" y=\"55\" text-anchor=\"middle\" font-size=\"20\">AV</text>"),
+    strict_text);
+  expect(!strict_anchor_list.success &&
+           strict_anchor_list.error.find(
+             "unsupported-text-anchor-chunk-positioning") != std::string::npos,
+         "multi-value x/y lists are rejected when middle/end anchoring creates multiple chunks");
+
+  const std::string px_anchor_list_source = svg(
+    "<text x=\"30px 70px\" y=\"55px\" text-anchor=\"middle\" "
+    "font-size=\"20px\">AV</text>");
+  const auto compatible_px_anchor_list =
+    svg_squisher::SvgSquisher{}.convert_string(
+      px_anchor_list_source, compatible_text);
+  const auto strict_px_anchor_list =
+    svg_squisher::SvgSquisher{}.convert_string(px_anchor_list_source, strict_text);
+  expect(compatible_px_anchor_list.success &&
+           contains_diagnostic(
+             compatible_px_anchor_list,
+             "unsupported-text-anchor-chunk-positioning") &&
+           !strict_px_anchor_list.success && strict_px_anchor_list.svg.empty() &&
+           strict_px_anchor_list.error.find(
+             "unsupported-text-anchor-chunk-positioning") != std::string::npos,
+         "px multi-value anchor lists use the same grammar in diagnostics and conversion");
+
+  const std::string normalized_space = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A B C</text>"), font));
+  const std::string split_space = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">  A  <tspan> B </tspan> C  </text>"), font));
+  expect(split_space == normalized_space,
+         "default SVG whitespace collapses consistently across span boundaries");
+
+  const std::string offset = concatenated_path_data(convert(svg(
+    "<text x=\"10\" dx=\"5\" y=\"50\" font-size=\"30\">A</text>"), font));
+  const std::string positioned = concatenated_path_data(convert(svg(
+    "<text x=\"15\" y=\"50\" font-size=\"30\">A</text>"), font));
+  expect(offset == positioned, "the first dx offset is applied exactly once");
+
+  const std::string parent_positions = concatenated_path_data(convert(svg(
+    "<text x=\"10 60\" y=\"40 70\" dx=\"2 3\" dy=\"4 5\" "
+    "font-size=\"30\">A<tspan>B</tspan></text>"), font));
+  const std::string direct_positions = concatenated_path_data(convert(svg(
+    "<text x=\"10 60\" y=\"40 70\" dx=\"2 3\" dy=\"4 5\" "
+    "font-size=\"30\">AB</text>"), font));
+  expect(parent_positions == direct_positions,
+         "parent x, y, dx, and dy lists continue across a nested tspan character");
+
+  const std::string nested_override = concatenated_path_data(convert(svg(
+    "<text x=\"10 60 80\" y=\"50\" font-size=\"30\">A"
+    "<tspan x=\"40\">B</tspan>C</text>"), font));
+  const std::string explicit_override = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A"
+    "<tspan x=\"40\">B</tspan><tspan x=\"80\">C</tspan></text>"), font));
+  expect(nested_override == explicit_override,
+         "a child override still consumes the matching parent-list character slot");
+
+  const std::string parent_offsets = concatenated_path_data(convert(svg(
+    "<text x=\"10\" dx=\"5 20\" y=\"50\" font-size=\"30\">A"
+    "<tspan>B</tspan></text>"), font));
+  const std::string explicit_offsets = concatenated_path_data(convert(svg(
+    "<text x=\"10\" dx=\"5\" y=\"50\" font-size=\"30\">A"
+    "<tspan dx=\"20\">B</tspan></text>"), font));
+  expect(parent_offsets == explicit_offsets,
+         "a parent dx list continues across a nested tspan without double application");
+
+  const std::string empty_span = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A"
+    "<tspan x=\"90\"></tspan>B</text>"), font));
+  const std::string neutral_empty_span = concatenated_path_data(convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\">A<tspan></tspan>B</text>"), font));
+  expect(empty_span == neutral_empty_span,
+         "an empty positioned tspan does not move the shared text cursor");
+
+  const std::string stroke_text = convert(svg(
+    "<text x=\"10\" y=\"50\" font-size=\"30\" fill=\"none\" stroke=\"red\">A</text>"), font);
+  expect(stroke_text.find("stroke=\"red\"") != std::string::npos,
+         "stroke-only text remains visible");
+
+  svg_squisher::StyleState requested_family;
+  requested_family.font_family = "a-family-that-must-not-override-the-cli";
+  expect(svg_squisher::resolve_text_font_path(requested_family, font, true) == font,
+         "an explicit command-line font is authoritative");
+
+  const std::string unresolved_family_svg = svg(
+    "<text x=\"10\" y=\"50\" font-family=\"Definitely Missing Family\">A</text>");
+  const auto fallback = svg_squisher::SvgSquisher{}.convert_string(unresolved_family_svg);
+  expect(fallback.success && contains_diagnostic(fallback, "font-family-substituted") &&
+           !fallback.fonts_used.empty() &&
+           contains_diagnostic_message(
+             fallback, "font-family-substituted", "Definitely Missing Family"),
+         "an unresolved requested family names the request and selected fallback action");
+
+  svg_squisher::Options authoritative;
+  authoritative.font_path = font;
+  const auto explicit_font =
+    svg_squisher::SvgSquisher{}.convert_string(unresolved_family_svg, authoritative);
+  expect(explicit_font.success &&
+           !contains_diagnostic(explicit_font, "font-family-substituted") &&
+           explicit_font.fonts_used == std::vector<std::string>{*font},
+         "an explicit command-line font overrides SVG family discovery without substitution");
+}
+
+}  // namespace
+
+int main() {
+  const std::vector<std::pair<std::string, std::function<void()>>> tests{
+    {"css-cascade", test_css_cascade},
+    {"opacity-hidden-content", test_opacity_and_hidden_content},
+    {"references-root-transform", test_references_and_root_transform},
+    {"case-sensitive-quoted-paint-reference", test_case_sensitive_quoted_paint_reference},
+    {"stroke-open-fill", test_stroke_and_open_fill_fidelity},
+    {"utf8-text-runs", test_utf8_and_text_runs},
+  };
+
+  for (const auto& [name, test] : tests) {
+    try {
+      test();
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: " << name << " threw: " << error.what() << '\n';
+      ++failures;
+    }
+  }
+
+  if (failures != 0) return 1;
+  std::cout << "style/text fidelity tests passed\n";
+  return 0;
+}

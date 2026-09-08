@@ -27,6 +27,8 @@ enum class TextAnchorMode {
 };
 
 struct ComputedStyle {
+  bool displayed = true;
+  bool visible = true;
   bool has_fill = false;
   bool has_stroke = false;
   bool has_dash_pattern = false;
@@ -49,4 +51,3 @@ std::string to_string(StrokeLineCap linecap);
 std::string to_string(StrokeLineJoin linejoin);
 
 }  // namespace svg_squisher
-

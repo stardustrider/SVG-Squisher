@@ -1,5 +1,6 @@
 ﻿#pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -9,6 +10,9 @@
 #include "svg_transform.h"
 
 namespace svg_squisher {
+
+bool path_data_is_valid(const std::string& d);
+std::size_t count_path_commands(const std::string& d);
 
 std::optional<std::string> bake_path_transform(const std::string& d, const Matrix& matrix);
 
@@ -26,4 +30,3 @@ void append_path_entry(std::vector<PathEntry>& out_paths,
                        bool emit_stroke);
 
 }  // namespace svg_squisher
-

@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "generator": "SVG Squisher",
+  "generatorVersion": "0.2.0",
+  "pathBase": "page",
+  "options": {
+    "conversionPolicy": "preserve-appearance",
+    "strict": false,
+    "recursive": false,
+    "continueOnError": true,
+    "removeBackground": false,
+    "overwrite": true,
+    "allowInPlace": false,
+    "precision": 3,
+    "fill": null,
+    "font": null
+  },
+  "summary": {
+    "converted": 4,
+    "failed": 1,
+    "skipped": 0,
+    "warnings": 3
+  },
+  "files": [
+    {
+      "input": "input/a space.svg",
+      "output": "output/a space.svg",
+      "status": "converted",
+      "error": null,
+      "inputBytes": 249,
+      "outputBytes": 249,
+      "inputElements": 2,
+      "inputPathCommands": 4,
+      "outputPaths": 1,
+      "outputPathCommands": 4,
+      "missingGlyphs": 0,
+      "fonts": [],
+      "fontIdentities": [],
+      "diagnostics": []
+    },
+    {
+      "input": "input/changed.svg",
+      "output": "output/changed.svg",
+      "status": "converted",
+      "error": null,
+      "inputBytes": 311,
+      "outputBytes": 434,
+      "inputElements": 3,
+      "inputPathCommands": 6,
+      "outputPaths": 3,
+      "outputPathCommands": 18,
+      "missingGlyphs": 0,
+      "fonts": [],
+      "fontIdentities": [],
+      "diagnostics": [
+        {
+          "severity": "warning",
+          "code": "example-review",
+          "message": "Example diagnostic showing how conversion warnings appear in the report.",
+          "element": "path"
+        }
+      ]
+    },
+    {
+      "input": "input/naïve.svg",
+      "output": "output/naïve.svg",
+      "status": "converted",
+      "error": null,
+      "inputBytes": 242,
+      "outputBytes": 242,
+      "inputElements": 1,
+      "inputPathCommands": 11,
+      "outputPaths": 1,
+      "outputPathCommands": 11,
+      "missingGlyphs": 0,
+      "fonts": [],
+      "fontIdentities": [],
+      "diagnostics": []
+    },
+    {
+      "input": "input/glyph warning.svg",
+      "output": "output/glyph warning.svg",
+      "status": "converted",
+      "error": null,
+      "inputBytes": 271,
+      "outputBytes": 301,
+      "inputElements": 2,
+      "inputPathCommands": 0,
+      "outputPaths": 2,
+      "outputPathCommands": 14,
+      "missingGlyphs": 1,
+      "fonts": ["/project/fonts/ProjectSans-Regular.ttf"],
+      "fontIdentities": [
+        {
+          "path": "/project/fonts/ProjectSans-Regular.ttf",
+          "bytes": null,
+          "sha256": null,
+          "error": "Font file is not bundled with this illustrative report."
+        }
+      ],
+      "diagnostics": [
+        {
+          "severity": "warning",
+          "code": "font-identity-unavailable",
+          "message": "The illustrative sample does not bundle the selected font file.",
+          "element": "text"
+        },
+        {
+          "severity": "warning",
+          "code": "missing-glyph",
+          "message": "The selected font did not contain U+2603 SNOWMAN.",
+          "element": "text"
+        }
+      ]
+    },
+    {
+      "input": "input/input-only.svg",
+      "output": "output/input-only.svg",
+      "status": "failed",
+      "error": "Example failed conversion; no output file was written.",
+      "inputBytes": 264,
+      "outputBytes": 0,
+      "inputElements": 1,
+      "inputPathCommands": 18,
+      "outputPaths": 0,
+      "outputPathCommands": 0,
+      "missingGlyphs": 0,
+      "fonts": [],
+      "fontIdentities": [],
+      "diagnostics": []
+    }
+  ]
+}

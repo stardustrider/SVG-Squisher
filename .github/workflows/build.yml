@@ -1,4 +1,4 @@
-name: Build
+name: Build and test
 
 on:
   push:
@@ -7,32 +7,130 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: ${{ matrix.os }} / ${{ matrix.config }}
-    runs-on: ${{ matrix.os }}
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        config: [Release]
+        include:
+          - name: Linux / Ubuntu 24.04 / x86-64
+            runner: ubuntu-24.04
+          - name: Windows Server 2025 / x86-64
+            runner: windows-2025
+          - name: macOS 15 / arm64
+            runner: macos-15
+          - name: macOS 15 / x86-64
+            runner: macos-15-intel
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DSVG_SQUISHER_WARNINGS_AS_ERRORS=ON
 
       - name: Build
-        run: cmake --build build --config ${{ matrix.config }}
+        run: cmake --build build --config Release --parallel
 
-      - name: Smoke Test
-        shell: bash
+      - name: Run CTest suite
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 30
+
+  sanitizers:
+    name: Linux / Clang / ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure sanitizer build
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build-sanitized
+          -DCMAKE_BUILD_TYPE=Debug
+          -DBUILD_TESTING=ON
+          -DSVG_SQUISHER_ENABLE_SANITIZERS=ON
+          -DSVG_SQUISHER_BUILD_FUZZER=ON
+          -DSVG_SQUISHER_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-sanitized --parallel
+
+      - name: Run CTest suite under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-sanitized --output-on-failure --timeout 30
+
+      - name: Exercise the conversion fuzzer corpus
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ./build/${{ matrix.config }}/svg_squisher.exe --help
-          else
-            ./build/svg_squisher --help
-          fi
+          mkdir fuzz-corpus
+          cp tests/fixtures/*.svg tests/visual/fixtures/*.svg fuzz-corpus/
+          ./build-sanitized/svg_squisher_fuzz -runs=1000 -timeout=5 fuzz-corpus
+
+  visual:
+    name: Visual fidelity / Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure converter
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DSVG_SQUISHER_WARNINGS_AS_ERRORS=ON
+
+      - name: Build converter
+        run: cmake --build build --config Release --target svg_squisher --parallel
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install locked visual-test dependencies
+        run: npm ci
+
+      - name: Test JavaScript harnesses
+        run: npm test
+
+      - name: Render and compare fixtures
+        env:
+          SVG_SQUISHER_BIN: ${{ github.workspace }}/build/svg_squisher
+          SVG_SQUISHER_DIFF_DIR: ${{ github.workspace }}/visual-diffs
+        run: npm run test:visual
+
+      - name: Upload visual diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: visual-regression-diffs
+          path: visual-diffs
+          if-no-files-found: ignore
